@@ -63,16 +63,15 @@
 <script>
 // ===================== tunables =====================
 const CFG = {
-  stopEnter:  0.30,   // box area fraction to ENTER stop
-  stopExit:   0.20,   // must fall below this to LEAVE stop (hysteresis)
-  warnArea:   0.12,   // worth mentioning at all
-  stopBottom: 0.78,   // box bottom this low in frame = very near
+  stopEnter:  0.30,     // box area fraction to ENTER stop
+  stopExit:   0.20,     // must fall below this to LEAVE stop (hysteresis)
+  warnArea:   0.12,     // worth mentioning at all
+  stopBottom: 0.78,     // box bottom this low in frame = very near
   minScore:   0.55,
-  holdFrames: 5,      // frames a state must persist before it is announced
-  stopHold:   2,      // stop reacts faster
-  restateMs:  4000,
-  stopRepeatMs: 1800,
-  laneBlockArea: 0.07 // per-lane blocked-ness threshold
+  holdFrames: 5,        // frames a state must persist before it counts
+  stopHold:   2,        // stop settles faster
+  speakEveryMs: 2000,   // ONE announcement per this interval - no interruptions
+  laneBlockArea: 0.07   // per-lane blocked-ness threshold
 };
 
 // ===================== elements =====================
@@ -104,17 +103,15 @@ function unlockSpeech() {                    // iOS needs this inside a real tap
   speechUnlocked = true;
 }
 
-function say(msg, urgent = false) {
+// Fixed cadence: at most one line per speakEveryMs, never overlapping.
+function say(msg) {
   if (!speakOn || !window.speechSynthesis) return;
   const now = performance.now();
-  const gap = urgent ? CFG.stopRepeatMs : CFG.restateMs;
-  if (msg === lastMsg && now - lastMsgAt < gap) return;
-
-  if (urgent) speechSynthesis.cancel();      // stop still cuts the queue
-  else if (speechSynthesis.speaking) return; // don't stack routine lines
+  if (now - lastMsgAt < CFG.speakEveryMs) return;
+  if (speechSynthesis.speaking) return;
 
   const u = new SpeechSynthesisUtterance(msg);
-  u.rate = 1.1;                              // same delivery for everything
+  u.rate = 1.1;
   u.pitch = 1;
   speechSynthesis.speak(u);
   lastMsg = msg; lastMsgAt = now;
@@ -171,7 +168,6 @@ function analyse(preds, W, H) {
 
   const blocked = lanes.map(a => a >= CFG.laneBlockArea);
 
-  // escape lane when the centre is blocked
   let advice = null;
   if (blocked[1]) {
     if (!blocked[0] && !blocked[2]) advice = lanes[0] <= lanes[2] ? 'left' : 'right';
@@ -219,11 +215,10 @@ async function loop() {
   const isStop = !!r.worst &&
                  (r.worst.area >= stopThresh || r.worst.bottom >= CFG.stopBottom);
 
-  let state, msg, urgent = false;
+  let state, msg;
 
   if (isStop) {
-    state = 'stop'; urgent = true;
-    msg = 'Stop';
+    state = 'stop';    msg = 'Stop';
   } else if (r.blocked[1] && r.advice && r.advice !== 'none') {
     state = 'divert';  msg = `Go ${r.advice}`;
   } else if (r.blocked[1]) {
@@ -238,16 +233,14 @@ async function loop() {
     state = 'clear';   msg = 'Clear';
   }
 
-  // ---- debounce: state must hold before it is announced ----
+  // ---- debounce, then speak on a fixed cadence ----
   if (state === pendingState) pendingCount++;
   else { pendingState = state; pendingCount = 1; }
 
   const need = (state === 'stop') ? CFG.stopHold : CFG.holdFrames;
   if (pendingCount >= need) {
-    if (state !== lastState || state === 'stop') {
-      say(msg, urgent);
-      lastState = state;
-    }
+    lastState = state;
+    if (state !== 'clear') say(msg);
   }
 
   sayEl.textContent = (lastState === 'clear') ? '' : msg;
@@ -296,7 +289,6 @@ document.getElementById('go').onclick = async () => {
 
     splash.style.display = 'none';
     running = true;
-    say('Ready');
     loop();
   } catch(e) {
     log('FAILED: ' + e.message, 'err');
