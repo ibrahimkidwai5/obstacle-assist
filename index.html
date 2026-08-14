@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Obstacle Assist</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #0b0d10; color: #e8eaed; overflow: hidden;
+         font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+  #stage { position: relative; width: 100vw; height: 100vh; background: #000; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+                  object-fit: cover; }
+  video { visibility: hidden; }
+  #hud { position: absolute; top: 0; left: 0; right: 0; padding: 14px 16px;
+         background: linear-gradient(#000b, #0000); font-size: 12px;
+         font-family: ui-monospace, monospace; line-height: 1.6;
+         pointer-events: none; text-shadow: 0 1px 3px #000; }
+  #corridor { position: absolute; bottom: 96px; left: 0; right: 0; text-align: center;
+              font-size: 34px; font-weight: 700; letter-spacing: -0.5px;
+              text-shadow: 0 2px 12px #000; pointer-events: none; }
+  #bar { position: absolute; bottom: 76px; left: 0; right: 0; height: 8px;
+         pointer-events: none; }
+  #bar i { position: absolute; height: 100%; background: #34d058; border-radius: 4px; }
+  #controls { position: absolute; bottom: 0; left: 0; right: 0;
+              padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+              display: flex; gap: 10px; background: linear-gradient(#0000, #000c); }
+  button { flex: 1; padding: 15px 8px; font-size: 15px; font-weight: 600;
+           border: 0; border-radius: 12px; background: #22262c; color: #e8eaed; }
+  button:active { background: #33383f; }
+  button.on { background: #34d058; color: #000; }
+  #splash { position: absolute; inset: 0; background: #0b0d10; z-index: 20;
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; gap: 18px; padding: 28px; text-align: center; }
+  #splash h1 { margin: 0; font-size: 23px; font-weight: 700; }
+  #splash p { margin: 0; font-size: 14px; color: #9aa0a6; max-width: 340px;
+              line-height: 1.55; }
+  #start { flex: none; padding: 16px 44px; font-size: 17px; background: #34d058;
+           color: #000; }
+  #status { font-family: ui-monospace, monospace; font-size: 11px; color: #6b7280;
+            white-space: pre-wrap; line-height: 1.7; }
+  .warn { color: #fbbf24; } .err { color: #f87171; } .ok { color: #34d058; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="vid" playsinline muted autoplay></video>
+  <canvas id="draw"></canvas>
+
+  <div id="hud"></div>
+  <div id="corridor"></div>
+  <div id="bar"><i></i></div>
+
+  <div id="controls">
+    <button id="btnCal">Calibrate</button>
+    <button id="btnAudio" class="on">Sound</button>
+    <button id="btnSpeech" class="on">Speech</button>
+    <button id="btnDepth">Depth</button>
+  </div>
+
+  <div id="splash">
+    <h1>Obstacle Assist</h1>
+    <p>Uses the rear camera to detect obstacles ahead and signal them with tone and
+       speech. Hold the device upright at chest height.</p>
+    <button id="start">Start</button>
+    <div id="status">Ready.</div>
+  </div>
+</div>
+
+<script type="module">
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6";
+env.allowLocalModels = false;
+
+// ---------------------------------------------------------------- config
+const CFG = {
+  warnM: 2.5, urgentM: 1.2, floorM: 0.4,
+  calDistanceM: 2.0,
+  corridorBins: 9,
+  speakCooldownMs: 3500,
+  hfovDeg: 68,                 // typical rear phone/tablet camera
+  named: new Set(["person","chair","car","bicycle","motorcycle","dog","bench",
+                  "potted plant","couch","dining table","tv","backpack","suitcase",
+                  "bus","truck","traffic light","stop sign","fire hydrant"]),
+};
+
+// ---------------------------------------------------------------- elements
+const vid = document.getElementById("vid");
+const cv = document.getElementById("draw");
+const cx = cv.getContext("2d");
+const hud = document.getElementById("hud");
+const corridorEl = document.getElementById("corridor");
+const barEl = document.querySelector("#bar i");
+const statusEl = document.getElementById("status");
+const splash = document.getElementById("splash");
+
+// offscreen buffer we feed to the models
+const work = document.createElement("canvas");
+const wcx = work.getContext("2d", { willReadFrequently: true });
+
+// ---------------------------------------------------------------- state
+let detector = null, depther = null;
+let tier = null, device = "wasm";
+let scale = 1.0, calibrated = false;
+let depthMap = null, depthW = 0, depthH = 0;
+let frameNo = 0, fpsEma = 0, lastSpoke = 0, lastMsg = "";
+let running = false, depthBusy = false;
+let showDepth = false, audioOn = true, speechOn = true;
+
+function log(msg, cls = "") {
+  statusEl.innerHTML += `\n<span class="${cls}">${msg}</span>`;
+  statusEl.scrollTop = statusEl.scrollHeight;
+}
+
+// ---------------------------------------------------------------- audio
+class Sonifier {
+  constructor() { this.ctx = null; }
+  init() {
+    if (this.ctx) return;
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.osc = this.ctx.createOscillator();
+    this.gain = this.ctx.createGain();
+    this.pan = this.ctx.createStereoPanner();
+    this.lfo = this.ctx.createOscillator();
+    this.lfoGain = this.ctx.createGain();
+
+    this.osc.type = "sine";
+    this.osc.frequency.value = 600;
+    this.gain.gain.value = 0;
+    this.lfo.type = "sine";
+    this.lfo.frequency.value = 3;
+    this.lfoGain.gain.value = 0;
+
+    this.lfo.connect(this.lfoGain).connect(this.gain.gain);
+    this.osc.connect(this.gain).connect(this.pan).connect(this.ctx.destination);
+    this.osc.start(); this.lfo.start();
+  }
+  set(active, freq, pan, rate) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime, g = this.gain.gain;
+    if (!active || !audioOn) { g.cancelScheduledValues(t); g.setTargetAtTime(0, t, 0.05);
+                               this.lfoGain.gain.setTargetAtTime(0, t, 0.05); return; }
+    this.osc.frequency.setTargetAtTime(freq, t, 0.04);
+    this.pan.pan.setTargetAtTime(pan, t, 0.04);
+    this.lfo.frequency.setTargetAtTime(rate, t, 0.04);
+    g.setTargetAtTime(0.13, t, 0.05);
+    this.lfoGain.gain.setTargetAtTime(0.12, t, 0.05);
+  }
+}
+const sonic = new Sonifier();
+
+function speak(msg) {
+  if (!speechOn || !window.speechSynthesis) return;
+  const now = performance.now();
+  if (now - lastSpoke < CFG.speakCooldownMs || msg === lastMsg) return;
+  const u = new SpeechSynthesisUtterance(msg);
+  u.rate = 1.15;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(u);
+  lastSpoke = now; lastMsg = msg;
+}
+
+// ------------------------------------------------- scene logic (portable)
+function bearingDeg(cxPix, width, hfov) {
+  return ((cxPix / width) * 2 - 1) * (hfov / 2);
+}
+
+function percentile(arr, p) {
+  const a = Float32Array.from(arr).sort();
+  return a[Math.min(a.length - 1, Math.max(0, Math.floor(a.length * p)))];
+}
+
+function boxDistance(box, dw, dh) {
+  if (!depthMap) return null;
+  const sx = dw / cv.width, sy = dh / cv.height;
+  let x1 = Math.round(box.xmin * sx), x2 = Math.round(box.xmax * sx);
+  let y1 = Math.round(box.ymin * sy), y2 = Math.round(box.ymax * sy);
+  const mx = (x2 - x1) * 0.2, my = (y2 - y1) * 0.2;
+  x1 = Math.max(0, Math.round(x1 + mx)); x2 = Math.min(dw, Math.round(x2 - mx));
+  y1 = Math.max(0, Math.round(y1 + my)); y2 = Math.min(dh, Math.round(y2 - my));
+  if (x2 <= x1 || y2 <= y1) return null;
+
+  const vals = [];
+  for (let y = y1; y < y2; y += 2)
+    for (let x = x1; x < x2; x += 2) vals.push(depthMap[y * dw + x]);
+  if (!vals.length) return null;
+
+  const near = percentile(vals, 0.85);
+  if (near <= 1e-6) return null;
+  return Math.max(CFG.floorM, scale / near);
+}
+
+function freeCorridor(dw, dh) {
+  if (!depthMap) return null;
+  const bins = CFG.corridorBins;
+  const y0 = Math.floor(dh * 0.55);
+  const clear = [];
+  for (let b = 0; b < bins; b++) {
+    const xa = Math.floor((b * dw) / bins), xb = Math.floor(((b + 1) * dw) / bins);
+    const vals = [];
+    for (let y = y0; y < dh; y += 2)
+      for (let x = xa; x < xb; x += 2) vals.push(depthMap[y * dw + x]);
+    if (!vals.length) { clear.push(false); continue; }
+    const near = percentile(vals, 0.9);
+    const d = near > 1e-6 ? Math.max(CFG.floorM, scale / near) : CFG.floorM;
+    clear.push(d > CFG.warnM);
+  }
+  let best = 0, bestStart = null, cur = null;
+  for (let i = 0; i <= bins; i++) {
+    const c = i < bins ? clear[i] : false;
+    if (c && cur === null) cur = i;
+    else if (!c && cur !== null) { if (i - cur > best) { best = i - cur; bestStart = cur; } cur = null; }
+  }
+  if (bestStart === null) return null;
+  return { start: bestStart, end: bestStart + best, centre: (bestStart + best / 2) / bins };
+}
+
+function directionWord(n) { return n < 0.35 ? "left" : n > 0.65 ? "right" : "ahead"; }
+
+function alertParams(distM, bearDeg) {
+  if (distM == null || distM > CFG.warnM) return { active: false };
+  const t = Math.min(1, Math.max(0, (CFG.warnM - distM) / (CFG.warnM - 0.3)));
+  return { active: true, freq: 400 + t * 900, rate: 2 + t * 9,
+           pan: Math.max(-1, Math.min(1, bearDeg / (CFG.hfovDeg / 2))) };
+}
+
+// ---------------------------------------------------------------- tiering
+async function benchmark(pipe, srcCanvas, runs = 3) {
+  const url = srcCanvas.toDataURL("image/jpeg", 0.85);
+  await pipe(url);                                  // warm up
+  const t = performance.now();
+  for (let i = 0; i < runs; i++) await pipe(url);
+  return (performance.now() - t) / runs;
+}
+
+async function setup() {
+  // WebGPU?
+  if ("gpu" in navigator) {
+    try { if (await navigator.gpu.requestAdapter()) device = "webgpu"; } catch {}
+  }
+  log(`Backend: ${device}`, device === "webgpu" ? "ok" : "warn");
+
+  log("Loading detection model...");
+  detector = await pipeline("object-detection", "Xenova/yolos-tiny", { device });
+  log("  ok", "ok");
+
+  // probe canvas for benchmarking
+  const probe = document.createElement("canvas");
+  probe.width = 320; probe.height = 240;
+  const p = probe.getContext("2d");
+  p.fillStyle = "#789"; p.fillRect(0, 0, 320, 240);
+  p.fillStyle = "#432"; p.fillRect(40, 90, 70, 100);
+
+  log("Benchmarking detection...");
+  const detMs = await benchmark(detector, probe);
+  log(`  ${detMs.toFixed(0)} ms/frame`);
+
+  if (detMs > 700) {
+    tier = "light";
+    log("Tier: LIGHT - detection only, no depth.", "warn");
+    log("Distances unavailable on this device.", "warn");
+  } else {
+    log("Loading depth model...");
+    depther = await pipeline("depth-estimation", "Xenova/depth-anything-small-hf", { device });
+    log("  ok", "ok");
+    log("Benchmarking depth...");
+    const depMs = await benchmark(depther, probe, 2);
+    log(`  ${depMs.toFixed(0)} ms/frame`);
+    tier = (detMs + depMs / 6) < 220 ? "full" : "reduced";
+    log(`Tier: ${tier.toUpperCase()}`, "ok");
+  }
+  return tier;
+}
+
+// ---------------------------------------------------------------- depth job
+async function refreshDepth() {
+  if (!depther || depthBusy) return;
+  depthBusy = true;
+  try {
+    const s = tier === "full" ? 0.5 : 0.35;
+    const dw = Math.round(cv.width * s), dh = Math.round(cv.height * s);
+    work.width = dw; work.height = dh;
+    wcx.drawImage(vid, 0, 0, dw, dh);
+    const out = await depther(work.toDataURL("image/jpeg", 0.8));
+    const raw = out.predicted_depth ?? out.depth;
+    // normalise to a Float32Array of size dw*dh
+    let data = raw.data ?? raw;
+    if (raw.width && raw.width !== dw) {
+      depthW = raw.width; depthH = raw.height;
+    } else { depthW = dw; depthH = dh; }
+    depthMap = data instanceof Float32Array ? data : Float32Array.from(data);
+  } catch (e) {
+    console.warn("depth failed", e);
+  }
+  depthBusy = false;
+}
+
+// ---------------------------------------------------------------- main loop
+async function loop() {
+  if (!running) return;
+  const t0 = performance.now();
+  frameNo++;
+
+  cx.drawImage(vid, 0, 0, cv.width, cv.height);
+
+  // depth refresh runs detached from the frame rate
+  const every = tier === "full" ? 4 : 8;
+  if (depther && frameNo % every === 0) refreshDepth();      // deliberately not awaited
+
+  // detection
+  let dets = [];
+  try {
+    const url = cv.toDataURL("image/jpeg", 0.8);
+    dets = await detector(url, { threshold: 0.35 });
+  } catch (e) { console.warn(e); }
+
+  // distances + bearings
+  const hazards = [];
+  for (const d of dets) {
+    const b = d.box;
+    const dist = depthMap ? boxDistance(b, depthW, depthH) : null;
+    const cxPix = ((b.xmin + b.xmax) / 2);
+    hazards.push({ label: d.label, dist, bear: bearingDeg(cxPix, cv.width, CFG.hfovDeg), box: b });
+  }
+  hazards.sort((a, b) => (a.dist ?? 99) - (b.dist ?? 99));
+  const nearest = hazards[0] ?? null;
+
+  // corridor
+  const corr = depthMap ? freeCorridor(depthW, depthH) : null;
+  const corrWord = corr ? directionWord(corr.centre) : (depthMap ? "blocked" : "-");
+
+  // alerts
+  if (nearest && nearest.dist != null) {
+    const a = alertParams(nearest.dist, nearest.bear);
+    sonic.set(a.active, a.freq, a.pan, a.rate);
+    if (calibrated && a.active && CFG.named.has(nearest.label)) {
+      const side = directionWord(nearest.bear / CFG.hfovDeg + 0.5);
+      let msg = `${nearest.label} ${side}, ${nearest.dist.toFixed(1)} metres`;
+      if (nearest.dist < CFG.urgentM && corr) msg += `. Clear ${corrWord}`;
+      speak(msg);
+    }
+  } else sonic.set(false);
+
+  // draw
+  if (showDepth && depthMap) drawDepth();
+  for (const h of hazards.slice(0, 6)) {
+    const urgent = h.dist != null && h.dist < CFG.urgentM;
+    const warn = h.dist != null && h.dist < CFG.warnM;
+    cx.strokeStyle = urgent ? "#f87171" : warn ? "#fbbf24" : "#34d058";
+    cx.lineWidth = 3;
+    cx.strokeRect(h.box.xmin, h.box.ymin, h.box.xmax - h.box.xmin, h.box.ymax - h.box.ymin);
+    cx.fillStyle = cx.strokeStyle;
+    cx.font = "600 15px system-ui";
+    const txt = h.dist != null ? `${h.label} ${h.dist.toFixed(1)}m` : h.label;
+    cx.fillText(txt, h.box.xmin + 3, Math.max(16, h.box.ymin - 5));
+  }
+
+  // hud
+  const ms = performance.now() - t0;
+  fpsEma = fpsEma ? fpsEma * 0.9 + (1000 / ms) * 0.1 : 1000 / ms;
+  hud.textContent =
+    `${fpsEma.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${device}/${tier}\n` +
+    (calibrated ? "calibrated" : "NOT CALIBRATED - aim at a wall 2m away, tap Calibrate");
+  corridorEl.textContent = corr || !depthMap ? corrWord : "blocked";
+  if (corr) {
+    barEl.style.left = (corr.start / CFG.corridorBins * 100) + "%";
+    barEl.style.width = ((corr.end - corr.start) / CFG.corridorBins * 100) + "%";
+  } else barEl.style.width = "0%";
+
+  requestAnimationFrame(loop);
+}
+
+function drawDepth() {
+  const img = cx.createImageData(depthW, depthH);
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < depthMap.length; i++) {
+    if (depthMap[i] < lo) lo = depthMap[i];
+    if (depthMap[i] > hi) hi = depthMap[i];
+  }
+  const rng = hi - lo || 1;
+  for (let i = 0; i < depthMap.length; i++) {
+    const v = ((depthMap[i] - lo) / rng) * 255;
+    img.data[i * 4] = v; img.data[i * 4 + 1] = v * 0.5;
+    img.data[i * 4 + 2] = 255 - v; img.data[i * 4 + 3] = 150;
+  }
+  const tmp = document.createElement("canvas");
+  tmp.width = depthW; tmp.height = depthH;
+  tmp.getContext("2d").putImageData(img, 0, 0);
+  cx.drawImage(tmp, 0, 0, cv.width, cv.height);
+}
+
+// ---------------------------------------------------------------- controls
+document.getElementById("btnCal").onclick = () => {
+  if (!depthMap) { alert("No depth on this device tier."); return; }
+  const w = depthW, h = depthH;
+  const vals = [];
+  for (let y = Math.floor(h * 0.4); y < Math.floor(h * 0.6); y++)
+    for (let x = Math.floor(w * 0.4); x < Math.floor(w * 0.6); x++) vals.push(depthMap[y * w + x]);
+  const ref = percentile(vals, 0.5);
+  if (ref > 1e-6) { scale = ref * CFG.calDistanceM; calibrated = true; speak("Calibrated"); }
+};
+document.getElementById("btnAudio").onclick = e => {
+  audioOn = !audioOn; e.target.classList.toggle("on", audioOn);
+};
+document.getElementById("btnSpeech").onclick = e => {
+  speechOn = !speechOn; e.target.classList.toggle("on", speechOn);
+};
+document.getElementById("btnDepth").onclick = e => {
+  showDepth = !showDepth; e.target.classList.toggle("on", showDepth);
+};
+
+// ---------------------------------------------------------------- start
+document.getElementById("start").onclick = async () => {
+  const btn = document.getElementById("start");
+  btn.disabled = true; btn.textContent = "Starting...";
+  try {
+    sonic.init();                                    // must follow a user gesture
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 640 } }, audio: false
+    });
+    vid.srcObject = stream;
+    await vid.play();
+    cv.width = vid.videoWidth || 640;
+    cv.height = vid.videoHeight || 480;
+    log(`Camera ${cv.width}x${cv.height}`, "ok");
+
+    await setup();
+    splash.style.display = "none";
+    running = true;
+    loop();
+  } catch (e) {
+    log("FAILED: " + e.message, "err");
+    if (location.protocol !== "https:" && location.hostname !== "localhost")
+      log("Camera needs HTTPS. Serve this over https.", "err");
+    btn.disabled = false; btn.textContent = "Retry";
+  }
+};
+</script>
+</body>
+</html>
