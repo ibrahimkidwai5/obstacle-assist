@@ -110,12 +110,12 @@ function say(msg, urgent = false) {
   const gap = urgent ? CFG.stopRepeatMs : CFG.restateMs;
   if (msg === lastMsg && now - lastMsgAt < gap) return;
 
-  if (urgent) speechSynthesis.cancel();      // stop cuts the queue
+  if (urgent) speechSynthesis.cancel();      // stop still cuts the queue
   else if (speechSynthesis.speaking) return; // don't stack routine lines
 
   const u = new SpeechSynthesisUtterance(msg);
-  u.rate = urgent ? 1.35 : 1.1;
-  u.pitch = urgent ? 1.2 : 1;
+  u.rate = 1.1;                              // same delivery for everything
+  u.pitch = 1;
   speechSynthesis.speak(u);
   lastMsg = msg; lastMsgAt = now;
 }
@@ -223,9 +223,7 @@ async function loop() {
 
   if (isStop) {
     state = 'stop'; urgent = true;
-    msg = (r.advice && r.advice !== 'none') ? `Stop. Go ${r.advice}`
-        : (r.advice === 'none')             ? 'Stop. No clear way'
-        : 'Stop';
+    msg = 'Stop';
   } else if (r.blocked[1] && r.advice && r.advice !== 'none') {
     state = 'divert';  msg = `Go ${r.advice}`;
   } else if (r.blocked[1]) {
