@@ -61,7 +61,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.all.min.js"></script>
 <script>
 // ===================== tunables =====================
 const CFG = {
@@ -71,23 +71,22 @@ const CFG = {
   voteMajority:  0.60,
   speakEveryMs:  2000,
 
-  // lane occupancy from BOX AREA (used when depth is off)
-  laneEnter:     0.07,
+  laneEnter:     0.07,   // box-area mode
   laneExit:      0.04,
 
-  // lane occupancy from DEPTH (used when depth is on)
-  depthEnter:    0.55,   // 0-1 normalised nearness
+  depthEnter:    0.55,   // depth mode, 0-1 nearness
   depthExit:     0.42,
-  depthEveryN:   4,      // run depth every Nth frame
-  depthSize:     252,    // model input (multiple of 14)
-  depthBandTop:  0.45,   // only look at the lower part of the frame
+  depthEveryN:   4,
+  depthSize:     252,    // must be a multiple of 14
+  depthBandTop:  0.45,
 
   laneSmooth:    0.25,
   commitMs:      2500
 };
 
+// 27 MB int8 build - the only quantized file in the -small repo
 const DEPTH_URL =
-  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx';
+  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_int8.onnx';
 
 // ===================== elements =====================
 const vid = document.getElementById('vid');
@@ -100,14 +99,13 @@ const logEl = document.getElementById('log');
 const splash = document.getElementById('splash');
 const bDepth = document.getElementById('bDepth');
 
-// offscreen buffer for depth preprocessing - allocated once
 const dcv = document.createElement('canvas');
 dcv.width = CFG.depthSize; dcv.height = CFG.depthSize;
 const dcx = dcv.getContext('2d', { willReadFrequently: true });
 
 let model = null, running = false;
 let depthSession = null, depthOn = false, depthBusy = false;
-let depthLanes = null, depthMs = 0;
+let depthLanes = null, depthMs = 0, depthEP = '';
 let speakOn = true, toneOn = true, boxesOn = true;
 let fps = 0, frameNo = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
@@ -128,7 +126,6 @@ function unlockSpeech() {
   speechSynthesis.speak(u);
   speechUnlocked = true;
 }
-
 function say(msg) {
   if (!speakOn || !window.speechSynthesis) return;
   const now = performance.now();
@@ -169,28 +166,31 @@ function tone(on, freq=620, pan=0, rate=3) {
 
 // ===================== depth =====================
 async function loadDepth() {
-  ort.env.wasm.numThreads = 1;               // Safari is happier single-threaded
+  ort.env.wasm.numThreads = 1;
   ort.env.wasm.simd = true;
-  depthSession = await ort.InferenceSession.create(DEPTH_URL,
-    { executionProviders: ['webgl', 'wasm'], graphOptimizationLevel: 'all' });
+  const eps = ('gpu' in navigator) ? ['webgpu', 'wasm'] : ['wasm'];
+  depthSession = await ort.InferenceSession.create(DEPTH_URL, {
+    executionProviders: eps,
+    graphOptimizationLevel: 'all'
+  });
+  depthEP = eps[0];
 }
 
-// ImageNet normalisation, NCHW float32
 function depthInput() {
   const S = CFG.depthSize;
   dcx.drawImage(vid, 0, 0, S, S);
   const px = dcx.getImageData(0, 0, S, S).data;
   const out = new Float32Array(3 * S * S);
   const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
-  for (let i = 0, n = S * S; i < n; i++) {
-    out[i]         = (px[i*4]   / 255 - mean[0]) / std[0];
-    out[i + n]     = (px[i*4+1] / 255 - mean[1]) / std[1];
-    out[i + 2*n]   = (px[i*4+2] / 255 - mean[2]) / std[2];
+  const n = S * S;
+  for (let i = 0; i < n; i++) {
+    out[i]       = (px[i*4]   / 255 - mean[0]) / std[0];
+    out[i + n]   = (px[i*4+1] / 255 - mean[1]) / std[1];
+    out[i + 2*n] = (px[i*4+2] / 255 - mean[2]) / std[2];
   }
   return new ort.Tensor('float32', out, [1, 3, S, S]);
 }
 
-// Returns normalised nearness per lane, 0..1
 function lanesFromDepth(map, w, h) {
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < map.length; i++) {
@@ -200,15 +200,13 @@ function lanesFromDepth(map, w, h) {
   const rng = (hi - lo) || 1;
   const y0 = Math.floor(h * CFG.depthBandTop);
   const out = [0, 0, 0];
-
   for (let L = 0; L < 3; L++) {
     const xa = Math.floor(L * w / 3), xb = Math.floor((L + 1) * w / 3);
     const vals = [];
     for (let y = y0; y < h; y += 2)
       for (let x = xa; x < xb; x += 2)
-        vals.push((map[y * w + x] - lo) / rng);     // 1 = nearest
+        vals.push((map[y * w + x] - lo) / rng);
     vals.sort();
-    // 80th percentile: the nearest substantial surface in this lane
     out[L] = vals.length ? vals[Math.floor(vals.length * 0.8)] : 0;
   }
   return out;
@@ -223,15 +221,15 @@ async function runDepth() {
     feeds[depthSession.inputNames[0]] = depthInput();
     const res = await depthSession.run(feeds);
     const out = res[depthSession.outputNames[0]];
-    const dims = out.dims;
-    const h = dims[dims.length - 2], w = dims[dims.length - 1];
+    const d = out.dims;
+    const h = d[d.length - 2], w = d[d.length - 1];
     depthLanes = lanesFromDepth(out.data, w, h);
     depthMs = performance.now() - t;
   } catch (e) {
     console.warn('depth', e);
-    log('Depth failed: ' + e.message, 'err');
-    depthOn = false; depthSession = null; depthLanes = null;
-    bDepth.classList.remove('on'); bDepth.textContent = 'Depth';
+    log('Depth run failed: ' + e.message, 'err');
+    depthOn = false; depthLanes = null;
+    bDepth.classList.remove('on');
   }
   depthBusy = false;
 }
@@ -276,22 +274,18 @@ async function loop() {
   const W = cvs.width, H = cvs.height;
   const { lanes, worst } = rawLanes(preds, W, H);
 
-  // kick off depth in the background - never awaited
   if (depthOn && depthSession && frameNo % CFG.depthEveryN === 0) runDepth();
 
-  // ---- choose lane source: depth if available, else box area ----
   const useDepth = depthOn && depthLanes;
-  const src = useDepth ? depthLanes : lanes;
+  const src   = useDepth ? depthLanes    : lanes;
   const enter = useDepth ? CFG.depthEnter : CFG.laneEnter;
   const exit  = useDepth ? CFG.depthExit  : CFG.laneExit;
 
   laneAvg = laneAvg.map((v, i) => v * (1 - CFG.laneSmooth) + src[i] * CFG.laneSmooth);
 
-  const blocked = laneAvg.map((a, i) =>
-    blockedState[i] ? a >= exit : a >= enter);
+  const blocked = laneAvg.map((a, i) => blockedState[i] ? a >= exit : a >= enter);
   blockedState = blocked;
 
-  // ---- advice, with direction commitment ----
   let advice = adviceFrom(blocked, laneAvg);
   if (advice === 'left' || advice === 'right') {
     const now = performance.now();
@@ -359,7 +353,7 @@ async function loop() {
   fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
   hud.textContent =
     `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}` +
-      (useDepth ? `  depth ${depthMs.toFixed(0)}ms` : '  depth off') + `\n` +
+      (useDepth ? `  depth ${depthMs.toFixed(0)}ms ${depthEP}` : '  depth off') + `\n` +
     `${preds.filter(p=>p.score>=CFG.minScore).length} obj  ${lastState}  ` +
     `L${laneAvg[0].toFixed(2)} C${laneAvg[1].toFixed(2)} R${laneAvg[2].toFixed(2)}` +
     (useDepth ? '  [depth]' : '  [boxes]');
@@ -411,7 +405,7 @@ document.getElementById('bBoxes').onclick = e => {
   boxesOn = !boxesOn; e.target.classList.toggle('on', boxesOn);
 };
 bDepth.onclick = async () => {
-  if (depthOn) {                       // turn off
+  if (depthOn) {
     depthOn = false; depthLanes = null;
     bDepth.classList.remove('on');
     laneAvg = [0,0,0]; blockedState = [false,false,false];
@@ -424,6 +418,7 @@ bDepth.onclick = async () => {
       bDepth.textContent = 'Depth';
     } catch (e) {
       bDepth.classList.remove('busy'); bDepth.textContent = 'Failed';
+      alert('Depth load failed: ' + e.message);
       console.warn(e);
       return;
     }
