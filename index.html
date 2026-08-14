@@ -5,34 +5,36 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Obstacle Assist</title>
 <style>
-  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  body{margin:0;background:#0b0d10;color:#e8eaed;overflow:hidden;
-       font-family:-apple-system,system-ui,sans-serif}
-  #stage{position:relative;width:100vw;height:100vh;background:#000}
-  video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-  #draw{position:absolute;inset:0;width:100%;height:100%}
-  #hud{position:absolute;top:0;left:0;right:0;padding:14px 16px;
-       background:linear-gradient(#000b,#0000);font-size:12px;
-       font-family:ui-monospace,monospace;line-height:1.6;pointer-events:none;
-       text-shadow:0 1px 3px #000;white-space:pre}
-  #big{position:absolute;bottom:100px;left:0;right:0;text-align:center;
-       font-size:30px;font-weight:700;text-shadow:0 2px 12px #000;pointer-events:none}
-  #controls{position:absolute;bottom:0;left:0;right:0;
-            padding:12px 14px calc(12px + env(safe-area-inset-bottom));
-            display:flex;gap:8px;background:linear-gradient(#0000,#000c)}
-  button{flex:1;padding:14px 6px;font-size:14px;font-weight:600;border:0;
-         border-radius:12px;background:#22262c;color:#e8eaed}
-  button:active{background:#33383f}
-  button.on{background:#34d058;color:#000}
-  #splash{position:absolute;inset:0;background:#0b0d10;z-index:20;display:flex;
-          flex-direction:column;align-items:center;justify-content:center;
-          gap:16px;padding:28px;text-align:center}
-  h1{margin:0;font-size:22px}
-  #splash p{margin:0;font-size:14px;color:#9aa0a6;max-width:330px;line-height:1.5}
-  #start{flex:none;padding:16px 44px;font-size:17px;background:#34d058;color:#000}
-  #status{font-family:ui-monospace,monospace;font-size:11px;color:#6b7280;
-          white-space:pre-wrap;line-height:1.6;max-height:40vh;overflow:auto}
-  .ok{color:#34d058}.warn{color:#fbbf24}.err{color:#f87171}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;
+    -webkit-user-select:none;user-select:none}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#fff;
+    font-family:-apple-system,system-ui,sans-serif}
+  #stage{position:fixed;inset:0}
+  video,#draw{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #hud{position:absolute;top:0;left:0;padding:10px 14px;font-size:11px;
+    font-family:ui-monospace,monospace;line-height:1.5;white-space:pre;
+    text-shadow:0 1px 3px #000;pointer-events:none;opacity:.85}
+  #say{position:absolute;left:0;right:0;bottom:88px;text-align:center;
+    font-size:clamp(24px,7vw,44px);font-weight:800;letter-spacing:-.5px;
+    text-shadow:0 2px 16px #000;pointer-events:none;padding:0 16px}
+  #say.stop{color:#ff5f56}
+  #bar{position:absolute;left:0;right:0;bottom:74px;height:6px;display:flex;gap:3px;
+    padding:0 14px;pointer-events:none}
+  #bar div{flex:1;border-radius:3px;background:#333;transition:background .15s}
+  #controls{position:absolute;left:0;right:0;bottom:0;display:flex;gap:8px;
+    padding:10px 12px calc(10px + env(safe-area-inset-bottom))}
+  button{flex:1;padding:13px 4px;font-size:13px;font-weight:700;border:0;
+    border-radius:11px;background:#23272e;color:#fff}
+  button.on{background:#30d158;color:#000}
+  #splash{position:absolute;inset:0;background:#000;z-index:9;display:flex;
+    flex-direction:column;align-items:center;justify-content:center;gap:14px;
+    padding:24px;text-align:center}
+  #splash h1{margin:0;font-size:21px}
+  #splash p{margin:0;max-width:320px;font-size:13px;color:#8e939a;line-height:1.5}
+  #go{flex:none;padding:15px 46px;font-size:17px;background:#30d158;color:#000}
+  #log{font-family:ui-monospace,monospace;font-size:10.5px;color:#6b7280;
+    white-space:pre-wrap;line-height:1.6;max-height:34vh;overflow:auto}
+  .ok{color:#30d158}.err{color:#ff5f56}
 </style>
 </head>
 <body>
@@ -40,249 +42,277 @@
   <video id="vid" playsinline muted autoplay></video>
   <canvas id="draw"></canvas>
   <div id="hud"></div>
-  <div id="big"></div>
+  <div id="say"></div>
+  <div id="bar"><div></div><div></div><div></div></div>
   <div id="controls">
-    <button id="bSound" class="on">Sound</button>
-    <button id="bSpeech" class="on">Speech</button>
-    <button id="bDepth">Load depth</button>
+    <button id="bSpeak" class="on">Speech</button>
+    <button id="bTone" class="on">Tone</button>
+    <button id="bBoxes" class="on">Boxes</button>
   </div>
   <div id="splash">
     <h1>Obstacle Assist</h1>
-    <p>Detects obstacles ahead using the rear camera and signals them by tone and
-       speech. Hold upright at chest height.</p>
-    <button id="start">Start</button>
-    <div id="status">Ready.</div>
+    <p>Speaks what is ahead and warns you to stop when something is close.
+       Hold upright at chest height, camera facing forward.</p>
+    <button id="go">Start</button>
+    <div id="log">Ready.</div>
   </div>
 </div>
 
-<script type="module">
-import { pipeline, RawImage, env } from
-  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6";
-env.allowLocalModels = false;
-
-// ------------------------------------------------------------------ config
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script>
+// ===================== tunables =====================
 const CFG = {
-  procW: 320, procH: 240,        // model input size - keep small for memory
-  hfovDeg: 68,
-  nearFrac: 0.55,                // box height / frame height counted as "very close"
-  warnFrac: 0.25,                // ...as "worth warning about"
-  speakMs: 3500,
-  named: new Set(["person","chair","car","bicycle","motorcycle","dog","bench",
-    "potted plant","couch","dining table","tv","backpack","suitcase","bus",
-    "truck","traffic light","stop sign","fire hydrant","door","stairs"]),
+  stopArea:   0.28,   // fraction of frame area -> STOP
+  warnArea:   0.10,   // fraction of frame area -> worth mentioning
+  stopBottom: 0.72,   // box bottom below this fraction of height = very near
+  minScore:   0.50,
+  restateMs:  4000,   // repeat the same message only after this long
+  stopRepeatMs: 1500, // stop repeats faster
+  clearFrames: 4,     // frames of nothing before saying "clear"
+  laneBlockArea: 0.06 // per-lane area that counts as blocked
 };
 
-const vid = document.getElementById("vid");
-const cv  = document.getElementById("draw");
-const cx  = cv.getContext("2d");
-const hud = document.getElementById("hud");
-const big = document.getElementById("big");
-const statusEl = document.getElementById("status");
-const splash = document.getElementById("splash");
+// ===================== elements =====================
+const vid = document.getElementById('vid');
+const cvs = document.getElementById('draw');
+const ctx = cvs.getContext('2d');
+const hud = document.getElementById('hud');
+const sayEl = document.getElementById('say');
+const lanesEl = [...document.querySelectorAll('#bar div')];
+const logEl = document.getElementById('log');
+const splash = document.getElementById('splash');
 
-// single reusable offscreen canvas - never allocate per frame
-const work = document.createElement("canvas");
-work.width = CFG.procW; work.height = CFG.procH;
-const wcx = work.getContext("2d", { willReadFrequently: true });
+let model = null, running = false;
+let speakOn = true, toneOn = true, boxesOn = true;
+let fps = 0, emptyRun = 0;
+let lastMsg = '', lastMsgAt = 0, lastState = '';
 
-let detector = null, depther = null, device = "wasm";
-let running = false, busy = false, depthBusy = false;
-let depthData = null, depthW = 0, depthH = 0;
-let frameNo = 0, fps = 0, lastSpoke = 0, lastMsg = "";
-let soundOn = true, speechOn = true;
+const log = (m, c='') => { logEl.innerHTML += `\n<span class="${c}">${m}</span>`;
+                           logEl.scrollTop = 1e6; };
 
-const log = (m, c = "") => {
-  statusEl.innerHTML += `\n<span class="${c}">${m}</span>`;
-  statusEl.scrollTop = 1e6;
-};
+// ===================== speech =====================
+// iOS requires a real user gesture before speechSynthesis will ever work.
+let speechUnlocked = false;
+function unlockSpeech() {
+  if (speechUnlocked || !window.speechSynthesis) return;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  speechSynthesis.speak(u);
+  speechUnlocked = true;
+}
 
-// ------------------------------------------------------------------ audio
-let actx = null, osc = null, gain = null, pan = null, lfo = null, lfoGain = null;
+function say(msg, urgent = false) {
+  sayEl.textContent = msg;
+  sayEl.classList.toggle('stop', urgent);
+  if (!speakOn || !window.speechSynthesis) return;
+
+  const now = performance.now();
+  const gap = urgent ? CFG.stopRepeatMs : CFG.restateMs;
+  if (msg === lastMsg && now - lastMsgAt < gap) return;
+
+  // urgent messages cut the queue
+  if (urgent) speechSynthesis.cancel();
+  else if (speechSynthesis.speaking) return;   // don't stack non-urgent lines
+
+  const u = new SpeechSynthesisUtterance(msg);
+  u.rate = urgent ? 1.35 : 1.1;
+  u.pitch = urgent ? 1.2 : 1;
+  speechSynthesis.speak(u);
+  lastMsg = msg; lastMsgAt = now;
+}
+
+// ===================== tone =====================
+let actx, osc, gain, panner, lfo, lfoGain;
 function audioInit() {
   if (actx) return;
   actx = new (window.AudioContext || window.webkitAudioContext)();
   osc = actx.createOscillator(); gain = actx.createGain();
-  pan = actx.createStereoPanner(); lfo = actx.createOscillator();
+  panner = actx.createStereoPanner(); lfo = actx.createOscillator();
   lfoGain = actx.createGain();
-  osc.type = "sine"; osc.frequency.value = 600;
+  osc.type = 'sine'; osc.frequency.value = 620;
   gain.gain.value = 0; lfo.frequency.value = 3; lfoGain.gain.value = 0;
   lfo.connect(lfoGain).connect(gain.gain);
-  osc.connect(gain).connect(pan).connect(actx.destination);
+  osc.connect(gain).connect(panner).connect(actx.destination);
   osc.start(); lfo.start();
+  if (actx.state === 'suspended') actx.resume();
 }
-function tone(active, freq = 600, p = 0, rate = 3) {
+function tone(on, freq=620, pan=0, rate=3) {
   if (!actx) return;
   const t = actx.currentTime;
-  if (!active || !soundOn) {
-    gain.gain.setTargetAtTime(0, t, .05);
-    lfoGain.gain.setTargetAtTime(0, t, .05);
-    return;
+  if (!on || !toneOn) { gain.gain.setTargetAtTime(0,t,.06);
+                        lfoGain.gain.setTargetAtTime(0,t,.06); return; }
+  osc.frequency.setTargetAtTime(freq,t,.05);
+  panner.pan.setTargetAtTime(pan,t,.05);
+  lfo.frequency.setTargetAtTime(rate,t,.05);
+  gain.gain.setTargetAtTime(.11,t,.06);
+  lfoGain.gain.setTargetAtTime(.1,t,.06);
+}
+
+// ============ scene logic (pure - portable to Python) ============
+function analyse(preds, W, H) {
+  const frameArea = W * H;
+  const lanes = [0, 0, 0];              // left, centre, right blocked-ness
+  let worst = null;
+
+  for (const p of preds) {
+    if (p.score < CFG.minScore) continue;
+    const [x, y, w, h] = p.bbox;
+    const area = (w * h) / frameArea;
+    const bottom = (y + h) / H;
+    const cxn = (x + w / 2) / W;
+
+    // nearness: big AND low in frame
+    const near = area / CFG.stopArea * 0.6 + Math.max(0, bottom - 0.5) * 0.8;
+
+    // spread its area across the lanes it covers
+    const l0 = Math.max(0, Math.floor((x / W) * 3));
+    const l1 = Math.min(2, Math.floor(((x + w) / W) * 3));
+    for (let i = l0; i <= l1; i++) lanes[i] += area;
+
+    if (!worst || near > worst.near)
+      worst = { label: p.class, area, bottom, cxn, near, bbox: p.bbox };
   }
-  osc.frequency.setTargetAtTime(freq, t, .04);
-  pan.pan.setTargetAtTime(p, t, .04);
-  lfo.frequency.setTargetAtTime(rate, t, .04);
-  gain.gain.setTargetAtTime(.13, t, .05);
-  lfoGain.gain.setTargetAtTime(.12, t, .05);
-}
-function speak(msg) {
-  if (!speechOn || !window.speechSynthesis) return;
-  const now = performance.now();
-  if (now - lastSpoke < CFG.speakMs || msg === lastMsg) return;
-  const u = new SpeechSynthesisUtterance(msg);
-  u.rate = 1.15;
-  speechSynthesis.cancel(); speechSynthesis.speak(u);
-  lastSpoke = now; lastMsg = msg;
+
+  const blocked = lanes.map(a => a >= CFG.laneBlockArea);
+  const isStop = !!worst && (worst.area >= CFG.stopArea || worst.bottom >= CFG.stopBottom);
+
+  // pick an escape lane when centre is blocked
+  let advice = null;
+  if (blocked[1]) {
+    if (!blocked[0] && !blocked[2]) advice = lanes[0] <= lanes[2] ? 'left' : 'right';
+    else if (!blocked[0]) advice = 'left';
+    else if (!blocked[2]) advice = 'right';
+    else advice = 'none';
+  }
+
+  return { worst, lanes, blocked, isStop, advice };
 }
 
-// ------------------------------------------------- scene logic (portable)
-export function bearingDeg(cxPix, width, hfov) {
-  return ((cxPix / width) * 2 - 1) * (hfov / 2);
-}
-export function proximityFromHeight(boxH, frameH) {
-  // crude monocular proxy: taller in frame == nearer
-  return Math.min(1, boxH / (frameH * CFG.nearFrac));
-}
-export function directionWord(n) {
-  return n < 0.35 ? "left" : n > 0.65 ? "right" : "ahead";
-}
-export function alertFor(prox, bearDeg) {
-  if (prox < CFG.warnFrac / CFG.nearFrac) return { active: false };
-  return {
-    active: true,
-    freq: 400 + prox * 900,
-    rate: 2 + prox * 9,
-    pan: Math.max(-1, Math.min(1, bearDeg / (CFG.hfovDeg / 2))),
-  };
-}
+function sideWord(cxn) { return cxn < 0.38 ? 'left' : cxn > 0.62 ? 'right' : 'ahead'; }
 
-// ------------------------------------------------------------------ frames
-function grabRaw() {
-  wcx.drawImage(vid, 0, 0, CFG.procW, CFG.procH);
-  const d = wcx.getImageData(0, 0, CFG.procW, CFG.procH);
-  return new RawImage(d.data, CFG.procW, CFG.procH, 4);
-}
-
-async function refreshDepth() {
-  if (!depther || depthBusy) return;
-  depthBusy = true;
-  try {
-    const out = await depther(grabRaw());
-    const raw = out.predicted_depth ?? out.depth;
-    const arr = raw.data ?? raw;
-    depthW = raw.width || CFG.procW;
-    depthH = raw.height || CFG.procH;
-    depthData = arr instanceof Float32Array ? arr : Float32Array.from(arr);
-  } catch (e) { console.warn("depth", e); }
-  depthBusy = false;
-}
-
-// ------------------------------------------------------------------ loop
+// ===================== main loop =====================
 async function loop() {
   if (!running) return;
   const t0 = performance.now();
-  frameNo++;
 
-  if (!busy) {
-    busy = true;
-    let dets = [];
-    try {
-      dets = await detector(grabRaw(), { threshold: 0.35, percentage: true });
-    } catch (e) { console.warn(e); }
-    busy = false;
+  let preds = [];
+  try { preds = await model.detect(vid, 8); } catch(e) { console.warn(e); }
 
-    if (depther && frameNo % 6 === 0) refreshDepth();
+  const W = cvs.width, H = cvs.height;
+  const r = analyse(preds, W, H);
 
-    // draw
-    cx.clearRect(0, 0, cv.width, cv.height);
-    const list = dets.map(d => {
-      const b = d.box;
-      const x = b.xmin * cv.width, y = b.ymin * cv.height;
-      const w = (b.xmax - b.xmin) * cv.width, h = (b.ymax - b.ymin) * cv.height;
-      return { label: d.label, x, y, w, h,
-               prox: proximityFromHeight(h, cv.height),
-               bear: bearingDeg(x + w / 2, cv.width, CFG.hfovDeg) };
-    }).sort((a, b) => b.prox - a.prox);
-
-    for (const o of list.slice(0, 6)) {
-      cx.strokeStyle = o.prox > .7 ? "#f87171" : o.prox > .4 ? "#fbbf24" : "#34d058";
-      cx.lineWidth = 3;
-      cx.strokeRect(o.x, o.y, o.w, o.h);
-      cx.fillStyle = cx.strokeStyle;
-      cx.font = "600 15px system-ui";
-      cx.fillText(o.label, o.x + 4, Math.max(16, o.y - 5));
+  // ---- draw ----
+  ctx.clearRect(0,0,W,H);
+  if (boxesOn) {
+    for (const p of preds) {
+      if (p.score < CFG.minScore) continue;
+      const [x,y,w,h] = p.bbox;
+      const a = (w*h)/(W*H);
+      ctx.strokeStyle = a >= CFG.stopArea ? '#ff5f56'
+                      : a >= CFG.warnArea ? '#ffbd2e' : '#30d158';
+      ctx.lineWidth = 3; ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle = ctx.strokeStyle; ctx.font = '600 15px system-ui';
+      ctx.fillText(p.class, x+4, Math.max(15, y-5));
     }
-
-    const near = list[0];
-    if (near) {
-      const a = alertFor(near.prox, near.bear);
-      tone(a.active, a.freq, a.pan, a.rate);
-      if (a.active && CFG.named.has(near.label)) {
-        const side = directionWord(near.bear / CFG.hfovDeg + .5);
-        speak(`${near.label} ${side}`);
-      }
-      big.textContent = a.active ? `${near.label} ${directionWord(near.bear / CFG.hfovDeg + .5)}` : "";
-    } else { tone(false); big.textContent = ""; }
-
-    const ms = performance.now() - t0;
-    fps = fps ? fps * .9 + (1000 / ms) * .1 : 1000 / ms;
-    hud.textContent =
-      `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${device}\n` +
-      `${dets.length} objects  ${depther ? "depth on" : "detection only"}`;
   }
+  lanesEl.forEach((el,i) =>
+    el.style.background = r.blocked[i] ? '#ff5f56' : '#30d158');
+
+  // ---- decide what to say ----
+  let state, msg, urgent = false;
+
+  if (r.isStop) {
+    state = 'stop';
+    urgent = true;
+    msg = r.advice && r.advice !== 'none' ? `Stop. Go ${r.advice}`
+        : r.advice === 'none' ? 'Stop. No clear way'
+        : 'Stop';
+  } else if (r.worst && r.worst.area >= CFG.warnArea) {
+    state = 'obstacle';
+    const side = sideWord(r.worst.cxn);
+    msg = r.blocked[1] && r.advice && r.advice !== 'none'
+        ? `${r.worst.label} ahead, go ${r.advice}`
+        : `${r.worst.label} ${side}`;
+  } else {
+    state = 'clear';
+    msg = 'Clear';
+  }
+
+  // only announce transitions, except stop which repeats
+  if (state === 'clear') {
+    emptyRun++;
+    if (emptyRun >= CFG.clearFrames && lastState !== 'clear') {
+      say('Clear'); lastState = 'clear';
+    } else if (lastState !== 'clear') sayEl.textContent = '';
+  } else {
+    emptyRun = 0;
+    if (state !== lastState || state === 'stop' || msg !== lastMsg) {
+      say(msg, urgent);
+    }
+    lastState = state;
+  }
+
+  // ---- tone ----
+  if (r.worst && r.worst.area >= CFG.warnArea) {
+    const t = Math.min(1, r.worst.area / CFG.stopArea);
+    tone(true, 420 + t*820, (r.worst.cxn*2-1), 2 + t*10);
+  } else tone(false);
+
+  // ---- hud ----
+  const ms = performance.now() - t0;
+  fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
+  hud.textContent =
+    `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}\n` +
+    `${preds.filter(p=>p.score>=CFG.minScore).length} objects  ${state}`;
+
   requestAnimationFrame(loop);
 }
 
-// ------------------------------------------------------------------ start
-document.getElementById("start").onclick = async () => {
-  const b = document.getElementById("start");
-  b.disabled = true; b.textContent = "Starting...";
+// ===================== start =====================
+document.getElementById('go').onclick = async () => {
+  const b = document.getElementById('go');
+  b.disabled = true; b.textContent = 'Starting...';
   try {
+    unlockSpeech();                 // must happen inside the tap
     audioInit();
+
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" },
-               width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:640}, height:{ideal:480} },
+      audio:false });
     vid.srcObject = stream;
     await vid.play();
-    cv.width = 640; cv.height = 480;
-    log(`Camera ${vid.videoWidth}x${vid.videoHeight}`, "ok");
+    await new Promise(res => vid.readyState >= 2 ? res()
+                          : vid.onloadeddata = res);
+    cvs.width = vid.videoWidth; cvs.height = vid.videoHeight;
+    log(`Camera ${cvs.width}x${cvs.height}`, 'ok');
 
-    if ("gpu" in navigator) {
-      try { if (await navigator.gpu.requestAdapter()) device = "webgpu"; } catch {}
-    }
-    log(`Backend: ${device}`, device === "webgpu" ? "ok" : "warn");
+    await tf.setBackend('webgl'); await tf.ready();
+    log(`Backend: ${tf.getBackend()}`, 'ok');
 
-    log("Loading detector (~25 MB)...");
-    detector = await pipeline("object-detection", "Xenova/yolos-tiny",
-                              { device, dtype: "q8" });
-    log("Ready.", "ok");
+    log('Loading detector...');
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    log('Ready.', 'ok');
 
-    splash.style.display = "none";
+    splash.style.display = 'none';
     running = true;
+    say('Ready');
     loop();
-  } catch (e) {
-    log("FAILED: " + e.message, "err");
-    b.disabled = false; b.textContent = "Retry";
+  } catch(e) {
+    log('FAILED: ' + e.message, 'err');
+    b.disabled = false; b.textContent = 'Retry';
   }
 };
 
-document.getElementById("bSound").onclick = e => {
-  soundOn = !soundOn; e.target.classList.toggle("on", soundOn);
+document.getElementById('bSpeak').onclick = e => {
+  speakOn = !speakOn; e.target.classList.toggle('on', speakOn);
+  if (!speakOn) speechSynthesis.cancel();
 };
-document.getElementById("bSpeech").onclick = e => {
-  speechOn = !speechOn; e.target.classList.toggle("on", speechOn);
+document.getElementById('bTone').onclick = e => {
+  toneOn = !toneOn; e.target.classList.toggle('on', toneOn);
 };
-document.getElementById("bDepth").onclick = async e => {
-  if (depther) { depther = null; depthData = null; e.target.classList.remove("on");
-                 return; }
-  e.target.textContent = "Loading...";
-  try {
-    depther = await pipeline("depth-estimation", "Xenova/depth-anything-small-hf",
-                             { device, dtype: "q8" });
-    e.target.textContent = "Depth"; e.target.classList.add("on");
-  } catch (err) {
-    e.target.textContent = "Depth failed";
-    console.warn(err);
-  }
+document.getElementById('bBoxes').onclick = e => {
+  boxesOn = !boxesOn; e.target.classList.toggle('on', boxesOn);
 };
 </script>
 </body>
