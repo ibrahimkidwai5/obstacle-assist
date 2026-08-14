@@ -63,14 +63,16 @@
 <script>
 // ===================== tunables =====================
 const CFG = {
-  stopArea:   0.28,   // fraction of frame area -> STOP
-  warnArea:   0.10,   // fraction of frame area -> worth mentioning
-  stopBottom: 0.72,   // box bottom below this fraction of height = very near
-  minScore:   0.50,
-  restateMs:  4000,   // repeat the same message only after this long
-  stopRepeatMs: 1500, // stop repeats faster
-  clearFrames: 4,     // frames of nothing before saying "clear"
-  laneBlockArea: 0.06 // per-lane area that counts as blocked
+  stopEnter:  0.30,   // box area fraction to ENTER stop
+  stopExit:   0.20,   // must fall below this to LEAVE stop (hysteresis)
+  warnArea:   0.12,   // worth mentioning at all
+  stopBottom: 0.78,   // box bottom this low in frame = very near
+  minScore:   0.55,
+  holdFrames: 5,      // frames a state must persist before it is announced
+  stopHold:   2,      // stop reacts faster
+  restateMs:  4000,
+  stopRepeatMs: 1800,
+  laneBlockArea: 0.07 // per-lane blocked-ness threshold
 };
 
 // ===================== elements =====================
@@ -85,16 +87,16 @@ const splash = document.getElementById('splash');
 
 let model = null, running = false;
 let speakOn = true, toneOn = true, boxesOn = true;
-let fps = 0, emptyRun = 0;
+let fps = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
+let pendingState = '', pendingCount = 0;
 
 const log = (m, c='') => { logEl.innerHTML += `\n<span class="${c}">${m}</span>`;
                            logEl.scrollTop = 1e6; };
 
 // ===================== speech =====================
-// iOS requires a real user gesture before speechSynthesis will ever work.
 let speechUnlocked = false;
-function unlockSpeech() {
+function unlockSpeech() {                    // iOS needs this inside a real tap
   if (speechUnlocked || !window.speechSynthesis) return;
   const u = new SpeechSynthesisUtterance(' ');
   u.volume = 0;
@@ -103,17 +105,13 @@ function unlockSpeech() {
 }
 
 function say(msg, urgent = false) {
-  sayEl.textContent = msg;
-  sayEl.classList.toggle('stop', urgent);
   if (!speakOn || !window.speechSynthesis) return;
-
   const now = performance.now();
   const gap = urgent ? CFG.stopRepeatMs : CFG.restateMs;
   if (msg === lastMsg && now - lastMsgAt < gap) return;
 
-  // urgent messages cut the queue
-  if (urgent) speechSynthesis.cancel();
-  else if (speechSynthesis.speaking) return;   // don't stack non-urgent lines
+  if (urgent) speechSynthesis.cancel();      // stop cuts the queue
+  else if (speechSynthesis.speaking) return; // don't stack routine lines
 
   const u = new SpeechSynthesisUtterance(msg);
   u.rate = urgent ? 1.35 : 1.1;
@@ -152,7 +150,7 @@ function tone(on, freq=620, pan=0, rate=3) {
 // ============ scene logic (pure - portable to Python) ============
 function analyse(preds, W, H) {
   const frameArea = W * H;
-  const lanes = [0, 0, 0];              // left, centre, right blocked-ness
+  const lanes = [0, 0, 0];                 // left, centre, right
   let worst = null;
 
   for (const p of preds) {
@@ -161,23 +159,19 @@ function analyse(preds, W, H) {
     const area = (w * h) / frameArea;
     const bottom = (y + h) / H;
     const cxn = (x + w / 2) / W;
+    const near = area / CFG.stopEnter * 0.6 + Math.max(0, bottom - 0.5) * 0.8;
 
-    // nearness: big AND low in frame
-    const near = area / CFG.stopArea * 0.6 + Math.max(0, bottom - 0.5) * 0.8;
-
-    // spread its area across the lanes it covers
     const l0 = Math.max(0, Math.floor((x / W) * 3));
     const l1 = Math.min(2, Math.floor(((x + w) / W) * 3));
     for (let i = l0; i <= l1; i++) lanes[i] += area;
 
     if (!worst || near > worst.near)
-      worst = { label: p.class, area, bottom, cxn, near, bbox: p.bbox };
+      worst = { label: p.class, area, bottom, cxn, near };
   }
 
   const blocked = lanes.map(a => a >= CFG.laneBlockArea);
-  const isStop = !!worst && (worst.area >= CFG.stopArea || worst.bottom >= CFG.stopBottom);
 
-  // pick an escape lane when centre is blocked
+  // escape lane when the centre is blocked
   let advice = null;
   if (blocked[1]) {
     if (!blocked[0] && !blocked[2]) advice = lanes[0] <= lanes[2] ? 'left' : 'right';
@@ -186,7 +180,7 @@ function analyse(preds, W, H) {
     else advice = 'none';
   }
 
-  return { worst, lanes, blocked, isStop, advice };
+  return { worst, lanes, blocked, advice };
 }
 
 function sideWord(cxn) { return cxn < 0.38 ? 'left' : cxn > 0.62 ? 'right' : 'ahead'; }
@@ -209,8 +203,8 @@ async function loop() {
       if (p.score < CFG.minScore) continue;
       const [x,y,w,h] = p.bbox;
       const a = (w*h)/(W*H);
-      ctx.strokeStyle = a >= CFG.stopArea ? '#ff5f56'
-                      : a >= CFG.warnArea ? '#ffbd2e' : '#30d158';
+      ctx.strokeStyle = a >= CFG.stopEnter ? '#ff5f56'
+                      : a >= CFG.warnArea  ? '#ffbd2e' : '#30d158';
       ctx.lineWidth = 3; ctx.strokeRect(x,y,w,h);
       ctx.fillStyle = ctx.strokeStyle; ctx.font = '600 15px system-ui';
       ctx.fillText(p.class, x+4, Math.max(15, y-5));
@@ -219,43 +213,51 @@ async function loop() {
   lanesEl.forEach((el,i) =>
     el.style.background = r.blocked[i] ? '#ff5f56' : '#30d158');
 
-  // ---- decide what to say ----
+  // ---- state, with hysteresis on the stop threshold ----
+  const inStop = lastState === 'stop';
+  const stopThresh = inStop ? CFG.stopExit : CFG.stopEnter;
+  const isStop = !!r.worst &&
+                 (r.worst.area >= stopThresh || r.worst.bottom >= CFG.stopBottom);
+
   let state, msg, urgent = false;
 
-  if (r.isStop) {
-    state = 'stop';
-    urgent = true;
-    msg = r.advice && r.advice !== 'none' ? `Stop. Go ${r.advice}`
-        : r.advice === 'none' ? 'Stop. No clear way'
+  if (isStop) {
+    state = 'stop'; urgent = true;
+    msg = (r.advice && r.advice !== 'none') ? `Stop. Go ${r.advice}`
+        : (r.advice === 'none')             ? 'Stop. No clear way'
         : 'Stop';
+  } else if (r.blocked[1] && r.advice && r.advice !== 'none') {
+    state = 'divert';  msg = `Go ${r.advice}`;
+  } else if (r.blocked[1]) {
+    state = 'blocked'; msg = 'Blocked ahead';
+  } else if (r.blocked[0] && !r.blocked[2]) {
+    state = 'sideL';   msg = 'Obstacle left, keep right';
+  } else if (r.blocked[2] && !r.blocked[0]) {
+    state = 'sideR';   msg = 'Obstacle right, keep left';
   } else if (r.worst && r.worst.area >= CFG.warnArea) {
-    state = 'obstacle';
-    const side = sideWord(r.worst.cxn);
-    msg = r.blocked[1] && r.advice && r.advice !== 'none'
-        ? `${r.worst.label} ahead, go ${r.advice}`
-        : `${r.worst.label} ${side}`;
+    state = 'note';    msg = `${r.worst.label} ${sideWord(r.worst.cxn)}`;
   } else {
-    state = 'clear';
-    msg = 'Clear';
+    state = 'clear';   msg = 'Clear';
   }
 
-  // only announce transitions, except stop which repeats
-  if (state === 'clear') {
-    emptyRun++;
-    if (emptyRun >= CFG.clearFrames && lastState !== 'clear') {
-      say('Clear'); lastState = 'clear';
-    } else if (lastState !== 'clear') sayEl.textContent = '';
-  } else {
-    emptyRun = 0;
-    if (state !== lastState || state === 'stop' || msg !== lastMsg) {
+  // ---- debounce: state must hold before it is announced ----
+  if (state === pendingState) pendingCount++;
+  else { pendingState = state; pendingCount = 1; }
+
+  const need = (state === 'stop') ? CFG.stopHold : CFG.holdFrames;
+  if (pendingCount >= need) {
+    if (state !== lastState || state === 'stop') {
       say(msg, urgent);
+      lastState = state;
     }
-    lastState = state;
   }
+
+  sayEl.textContent = (lastState === 'clear') ? '' : msg;
+  sayEl.classList.toggle('stop', lastState === 'stop');
 
   // ---- tone ----
   if (r.worst && r.worst.area >= CFG.warnArea) {
-    const t = Math.min(1, r.worst.area / CFG.stopArea);
+    const t = Math.min(1, r.worst.area / CFG.stopEnter);
     tone(true, 420 + t*820, (r.worst.cxn*2-1), 2 + t*10);
   } else tone(false);
 
@@ -264,7 +266,8 @@ async function loop() {
   fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
   hud.textContent =
     `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}\n` +
-    `${preds.filter(p=>p.score>=CFG.minScore).length} objects  ${state}`;
+    `${preds.filter(p=>p.score>=CFG.minScore).length} obj  ${lastState}  ` +
+    `L${r.lanes[0].toFixed(2)} C${r.lanes[1].toFixed(2)} R${r.lanes[2].toFixed(2)}`;
 
   requestAnimationFrame(loop);
 }
@@ -274,7 +277,7 @@ document.getElementById('go').onclick = async () => {
   const b = document.getElementById('go');
   b.disabled = true; b.textContent = 'Starting...';
   try {
-    unlockSpeech();                 // must happen inside the tap
+    unlockSpeech();
     audioInit();
 
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -282,8 +285,7 @@ document.getElementById('go').onclick = async () => {
       audio:false });
     vid.srcObject = stream;
     await vid.play();
-    await new Promise(res => vid.readyState >= 2 ? res()
-                          : vid.onloadeddata = res);
+    await new Promise(res => vid.readyState >= 2 ? res() : vid.onloadeddata = res);
     cvs.width = vid.videoWidth; cvs.height = vid.videoHeight;
     log(`Camera ${cvs.width}x${cvs.height}`, 'ok');
 
