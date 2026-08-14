@@ -19,12 +19,13 @@
     text-shadow:0 2px 16px #000;pointer-events:none;padding:0 16px}
   #bar{position:absolute;left:0;right:0;bottom:74px;height:6px;display:flex;gap:3px;
     padding:0 14px;pointer-events:none}
-  #bar div{flex:1;border-radius:3px;background:#333;transition:background .15s}
-  #controls{position:absolute;left:0;right:0;bottom:0;display:flex;gap:8px;
+  #bar div{flex:1;border-radius:3px;background:#333;transition:background .2s}
+  #controls{position:absolute;left:0;right:0;bottom:0;display:flex;gap:6px;
     padding:10px 12px calc(10px + env(safe-area-inset-bottom))}
-  button{flex:1;padding:13px 4px;font-size:13px;font-weight:700;border:0;
+  button{flex:1;padding:13px 2px;font-size:12px;font-weight:700;border:0;
     border-radius:11px;background:#23272e;color:#fff}
   button.on{background:#30d158;color:#000}
+  button.busy{background:#ffbd2e;color:#000}
   #splash{position:absolute;inset:0;background:#000;z-index:9;display:flex;
     flex-direction:column;align-items:center;justify-content:center;gap:14px;
     padding:24px;text-align:center}
@@ -47,6 +48,7 @@
     <button id="bSpeak" class="on">Speech</button>
     <button id="bTone" class="on">Tone</button>
     <button id="bBoxes" class="on">Boxes</button>
+    <button id="bDepth">Depth</button>
   </div>
   <div id="splash">
     <h1>Obstacle Assist</h1>
@@ -59,16 +61,33 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
 <script>
 // ===================== tunables =====================
 const CFG = {
-  warnArea:      0.12,   // object big enough to be worth naming
-  minScore:      0.55,
-  holdFrames:    5,      // frames a state must persist before it counts
-  speakEveryMs:  2000,   // one announcement per this interval
-  laneEnter:     0.07,   // lane becomes BLOCKED above this
-  laneExit:      0.04    // lane becomes CLEAR only below this (hysteresis)
+  warnArea:      0.12,
+  minScore:      0.45,
+  voteWindow:    12,
+  voteMajority:  0.60,
+  speakEveryMs:  2000,
+
+  // lane occupancy from BOX AREA (used when depth is off)
+  laneEnter:     0.07,
+  laneExit:      0.04,
+
+  // lane occupancy from DEPTH (used when depth is on)
+  depthEnter:    0.55,   // 0-1 normalised nearness
+  depthExit:     0.42,
+  depthEveryN:   4,      // run depth every Nth frame
+  depthSize:     252,    // model input (multiple of 14)
+  depthBandTop:  0.45,   // only look at the lower part of the frame
+
+  laneSmooth:    0.25,
+  commitMs:      2500
 };
+
+const DEPTH_URL =
+  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx';
 
 // ===================== elements =====================
 const vid = document.getElementById('vid');
@@ -79,20 +98,30 @@ const sayEl = document.getElementById('say');
 const lanesEl = [...document.querySelectorAll('#bar div')];
 const logEl = document.getElementById('log');
 const splash = document.getElementById('splash');
+const bDepth = document.getElementById('bDepth');
+
+// offscreen buffer for depth preprocessing - allocated once
+const dcv = document.createElement('canvas');
+dcv.width = CFG.depthSize; dcv.height = CFG.depthSize;
+const dcx = dcv.getContext('2d', { willReadFrequently: true });
 
 let model = null, running = false;
+let depthSession = null, depthOn = false, depthBusy = false;
+let depthLanes = null, depthMs = 0;
 let speakOn = true, toneOn = true, boxesOn = true;
-let fps = 0;
+let fps = 0, frameNo = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
-let pendingState = '', pendingCount = 0;
-let blockedState = [false, false, false];   // persists for hysteresis
+let blockedState = [false, false, false];
+let laneAvg = [0, 0, 0];
+let voteBuf = [];
+let committedSide = null, committedAt = 0;
 
 const log = (m, c='') => { logEl.innerHTML += `\n<span class="${c}">${m}</span>`;
                            logEl.scrollTop = 1e6; };
 
 // ===================== speech =====================
 let speechUnlocked = false;
-function unlockSpeech() {                    // iOS needs this inside a real tap
+function unlockSpeech() {
   if (speechUnlocked || !window.speechSynthesis) return;
   const u = new SpeechSynthesisUtterance(' ');
   u.volume = 0;
@@ -100,16 +129,13 @@ function unlockSpeech() {                    // iOS needs this inside a real tap
   speechUnlocked = true;
 }
 
-// Fixed cadence: at most one line per speakEveryMs, never overlapping.
 function say(msg) {
   if (!speakOn || !window.speechSynthesis) return;
   const now = performance.now();
   if (now - lastMsgAt < CFG.speakEveryMs) return;
   if (speechSynthesis.speaking) return;
-
   const u = new SpeechSynthesisUtterance(msg);
-  u.rate = 1.1;
-  u.pitch = 1;
+  u.rate = 1.1; u.pitch = 1;
   speechSynthesis.speak(u);
   lastMsg = msg; lastMsgAt = now;
 }
@@ -141,41 +167,99 @@ function tone(on, freq=620, pan=0, rate=3) {
   lfoGain.gain.setTargetAtTime(.1,t,.06);
 }
 
-// ============ scene logic (pure - portable to Python) ============
-function analyse(preds, W, H, prevBlocked) {
-  const frameArea = W * H;
-  const lanes = [0, 0, 0];                 // left, centre, right
-  let worst = null;
+// ===================== depth =====================
+async function loadDepth() {
+  ort.env.wasm.numThreads = 1;               // Safari is happier single-threaded
+  ort.env.wasm.simd = true;
+  depthSession = await ort.InferenceSession.create(DEPTH_URL,
+    { executionProviders: ['webgl', 'wasm'], graphOptimizationLevel: 'all' });
+}
 
+// ImageNet normalisation, NCHW float32
+function depthInput() {
+  const S = CFG.depthSize;
+  dcx.drawImage(vid, 0, 0, S, S);
+  const px = dcx.getImageData(0, 0, S, S).data;
+  const out = new Float32Array(3 * S * S);
+  const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+  for (let i = 0, n = S * S; i < n; i++) {
+    out[i]         = (px[i*4]   / 255 - mean[0]) / std[0];
+    out[i + n]     = (px[i*4+1] / 255 - mean[1]) / std[1];
+    out[i + 2*n]   = (px[i*4+2] / 255 - mean[2]) / std[2];
+  }
+  return new ort.Tensor('float32', out, [1, 3, S, S]);
+}
+
+// Returns normalised nearness per lane, 0..1
+function lanesFromDepth(map, w, h) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < map.length; i++) {
+    if (map[i] < lo) lo = map[i];
+    if (map[i] > hi) hi = map[i];
+  }
+  const rng = (hi - lo) || 1;
+  const y0 = Math.floor(h * CFG.depthBandTop);
+  const out = [0, 0, 0];
+
+  for (let L = 0; L < 3; L++) {
+    const xa = Math.floor(L * w / 3), xb = Math.floor((L + 1) * w / 3);
+    const vals = [];
+    for (let y = y0; y < h; y += 2)
+      for (let x = xa; x < xb; x += 2)
+        vals.push((map[y * w + x] - lo) / rng);     // 1 = nearest
+    vals.sort();
+    // 80th percentile: the nearest substantial surface in this lane
+    out[L] = vals.length ? vals[Math.floor(vals.length * 0.8)] : 0;
+  }
+  return out;
+}
+
+async function runDepth() {
+  if (!depthSession || depthBusy) return;
+  depthBusy = true;
+  const t = performance.now();
+  try {
+    const feeds = {};
+    feeds[depthSession.inputNames[0]] = depthInput();
+    const res = await depthSession.run(feeds);
+    const out = res[depthSession.outputNames[0]];
+    const dims = out.dims;
+    const h = dims[dims.length - 2], w = dims[dims.length - 1];
+    depthLanes = lanesFromDepth(out.data, w, h);
+    depthMs = performance.now() - t;
+  } catch (e) {
+    console.warn('depth', e);
+    log('Depth failed: ' + e.message, 'err');
+    depthOn = false; depthSession = null; depthLanes = null;
+    bDepth.classList.remove('on'); bDepth.textContent = 'Depth';
+  }
+  depthBusy = false;
+}
+
+// ============ scene logic (pure - portable to Python) ============
+function rawLanes(preds, W, H) {
+  const frameArea = W * H;
+  const lanes = [0, 0, 0];
+  let worst = null;
   for (const p of preds) {
     if (p.score < CFG.minScore) continue;
     const [x, y, w, h] = p.bbox;
     const area = (w * h) / frameArea;
-    const bottom = (y + h) / H;
     const cxn = (x + w / 2) / W;
-
     const l0 = Math.max(0, Math.floor((x / W) * 3));
     const l1 = Math.min(2, Math.floor(((x + w) / W) * 3));
     for (let i = l0; i <= l1; i++) lanes[i] += area;
-
-    if (!worst || area > worst.area)
-      worst = { label: p.class, area, bottom, cxn };
+    if (!worst || area > worst.area) worst = { label: p.class, area, cxn };
   }
+  return { lanes, worst };
+}
 
-  // hysteresis per lane: harder to become blocked than to stay blocked
-  const blocked = lanes.map((a, i) =>
-    prevBlocked[i] ? a >= CFG.laneExit : a >= CFG.laneEnter);
-
-  // where to go when the centre is not usable
-  let advice = null;
-  if (blocked[1]) {
-    if (!blocked[0] && !blocked[2]) advice = lanes[0] <= lanes[2] ? 'left' : 'right';
-    else if (!blocked[0]) advice = 'left';
-    else if (!blocked[2]) advice = 'right';
-    else advice = 'none';
-  }
-
-  return { worst, lanes, blocked, advice };
+function adviceFrom(blocked, avg) {
+  if (!blocked[1]) return null;
+  if (!blocked[0] && !blocked[2]) return avg[0] <= avg[2] ? 'left' : 'right';
+  if (!blocked[0]) return 'left';
+  if (!blocked[2]) return 'right';
+  return 'none';
 }
 
 function sideWord(cxn) { return cxn < 0.38 ? 'left' : cxn > 0.62 ? 'right' : 'ahead'; }
@@ -184,13 +268,36 @@ function sideWord(cxn) { return cxn < 0.38 ? 'left' : cxn > 0.62 ? 'right' : 'ah
 async function loop() {
   if (!running) return;
   const t0 = performance.now();
+  frameNo++;
 
   let preds = [];
   try { preds = await model.detect(vid, 8); } catch(e) { console.warn(e); }
 
   const W = cvs.width, H = cvs.height;
-  const r = analyse(preds, W, H, blockedState);
-  blockedState = r.blocked;
+  const { lanes, worst } = rawLanes(preds, W, H);
+
+  // kick off depth in the background - never awaited
+  if (depthOn && depthSession && frameNo % CFG.depthEveryN === 0) runDepth();
+
+  // ---- choose lane source: depth if available, else box area ----
+  const useDepth = depthOn && depthLanes;
+  const src = useDepth ? depthLanes : lanes;
+  const enter = useDepth ? CFG.depthEnter : CFG.laneEnter;
+  const exit  = useDepth ? CFG.depthExit  : CFG.laneExit;
+
+  laneAvg = laneAvg.map((v, i) => v * (1 - CFG.laneSmooth) + src[i] * CFG.laneSmooth);
+
+  const blocked = laneAvg.map((a, i) =>
+    blockedState[i] ? a >= exit : a >= enter);
+  blockedState = blocked;
+
+  // ---- advice, with direction commitment ----
+  let advice = adviceFrom(blocked, laneAvg);
+  if (advice === 'left' || advice === 'right') {
+    const now = performance.now();
+    if (committedSide && now - committedAt < CFG.commitMs) advice = committedSide;
+    else { committedSide = advice; committedAt = now; }
+  } else committedSide = null;
 
   // ---- draw ----
   ctx.clearRect(0,0,W,H);
@@ -206,51 +313,56 @@ async function loop() {
     }
   }
   lanesEl.forEach((el,i) =>
-    el.style.background = r.blocked[i] ? '#ff5f56' : '#30d158');
+    el.style.background = blocked[i] ? '#ff5f56' : '#30d158');
 
-  // ---- decide what to say (no stop state) ----
+  // ---- candidate state ----
   let state, msg;
-
-  if (r.blocked[1] && r.advice && r.advice !== 'none') {
-    state = 'divert';  msg = `Go ${r.advice}`;
-  } else if (r.blocked[1]) {
+  if (blocked[1] && advice && advice !== 'none') {
+    state = 'divert';  msg = `Go ${advice}`;
+  } else if (blocked[1]) {
     state = 'blocked'; msg = 'Blocked ahead';
-  } else if (r.blocked[0] && !r.blocked[2]) {
-    state = 'sideL';   msg = 'Obstacle left, keep right';
-  } else if (r.blocked[2] && !r.blocked[0]) {
-    state = 'sideR';   msg = 'Obstacle right, keep left';
-  } else if (r.blocked[0] && r.blocked[2]) {
+  } else if (blocked[0] && blocked[2]) {
     state = 'sides';   msg = 'Obstacles both sides, centre clear';
-  } else if (r.worst && r.worst.area >= CFG.warnArea) {
-    state = 'note';    msg = `${r.worst.label} ${sideWord(r.worst.cxn)}`;
+  } else if (blocked[0]) {
+    state = 'sideL';   msg = 'Obstacle left, keep right';
+  } else if (blocked[2]) {
+    state = 'sideR';   msg = 'Obstacle right, keep left';
+  } else if (worst && worst.area >= CFG.warnArea) {
+    state = 'note';    msg = `${worst.label} ${sideWord(worst.cxn)}`;
   } else {
     state = 'clear';   msg = 'Clear';
   }
 
-  // ---- debounce, then speak on a fixed cadence ----
-  if (state === pendingState) pendingCount++;
-  else { pendingState = state; pendingCount = 1; }
+  // ---- majority vote ----
+  voteBuf.push({ state, msg });
+  if (voteBuf.length > CFG.voteWindow) voteBuf.shift();
+  const tally = {};
+  for (const v of voteBuf) tally[v.state] = (tally[v.state] || 0) + 1;
+  let winner = null, best = 0;
+  for (const k in tally) if (tally[k] > best) { best = tally[k]; winner = k; }
 
-  if (pendingCount >= CFG.holdFrames) {
-    lastState = state;
-    if (state !== 'clear') say(msg);
+  if (voteBuf.length >= CFG.voteWindow && best / voteBuf.length >= CFG.voteMajority) {
+    lastState = winner;
+    msg = [...voteBuf].reverse().find(v => v.state === winner).msg;
+    if (winner !== 'clear') say(msg);
   }
-
   sayEl.textContent = (lastState === 'clear') ? '' : msg;
 
   // ---- tone ----
-  if (r.worst && r.worst.area >= CFG.warnArea) {
-    const t = Math.min(1, r.worst.area / 0.30);
-    tone(true, 420 + t*820, (r.worst.cxn*2-1), 2 + t*10);
+  if (worst && worst.area >= CFG.warnArea) {
+    const t = Math.min(1, worst.area / 0.30);
+    tone(true, 420 + t*820, (worst.cxn*2-1), 2 + t*10);
   } else tone(false);
 
   // ---- hud ----
   const ms = performance.now() - t0;
   fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
   hud.textContent =
-    `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}\n` +
+    `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}` +
+      (useDepth ? `  depth ${depthMs.toFixed(0)}ms` : '  depth off') + `\n` +
     `${preds.filter(p=>p.score>=CFG.minScore).length} obj  ${lastState}  ` +
-    `L${r.lanes[0].toFixed(2)} C${r.lanes[1].toFixed(2)} R${r.lanes[2].toFixed(2)}`;
+    `L${laneAvg[0].toFixed(2)} C${laneAvg[1].toFixed(2)} R${laneAvg[2].toFixed(2)}` +
+    (useDepth ? '  [depth]' : '  [boxes]');
 
   requestAnimationFrame(loop);
 }
@@ -277,7 +389,7 @@ document.getElementById('go').onclick = async () => {
 
     log('Loading detector...');
     model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-    log('Ready.', 'ok');
+    log('Ready. Tap Depth to add wall detection.', 'ok');
 
     splash.style.display = 'none';
     running = true;
@@ -297,6 +409,29 @@ document.getElementById('bTone').onclick = e => {
 };
 document.getElementById('bBoxes').onclick = e => {
   boxesOn = !boxesOn; e.target.classList.toggle('on', boxesOn);
+};
+bDepth.onclick = async () => {
+  if (depthOn) {                       // turn off
+    depthOn = false; depthLanes = null;
+    bDepth.classList.remove('on');
+    laneAvg = [0,0,0]; blockedState = [false,false,false];
+    return;
+  }
+  if (!depthSession) {
+    bDepth.classList.add('busy'); bDepth.textContent = '...';
+    try {
+      await loadDepth();
+      bDepth.textContent = 'Depth';
+    } catch (e) {
+      bDepth.classList.remove('busy'); bDepth.textContent = 'Failed';
+      console.warn(e);
+      return;
+    }
+    bDepth.classList.remove('busy');
+  }
+  depthOn = true; depthLanes = null;
+  laneAvg = [0,0,0]; blockedState = [false,false,false];
+  bDepth.classList.add('on');
 };
 </script>
 </body>
