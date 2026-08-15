@@ -84,9 +84,12 @@ const CFG = {
   commitMs:      2500
 };
 
-// 27 MB int8 build - the only quantized file in the -small repo
-const DEPTH_URL =
-  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_int8.onnx';
+// q4f16: 4-bit weights, fp16 compute. Avoids the ConvInteger ops that the
+// int8 build needs and that ONNX Runtime Web has no implementation for.
+const DEPTH_URLS = [
+  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4f16.onnx',
+  'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx'
+];
 
 // ===================== elements =====================
 const vid = document.getElementById('vid');
@@ -105,7 +108,7 @@ const dcx = dcv.getContext('2d', { willReadFrequently: true });
 
 let model = null, running = false;
 let depthSession = null, depthOn = false, depthBusy = false;
-let depthLanes = null, depthMs = 0, depthEP = '';
+let depthLanes = null, depthMs = 0, depthTag = '';
 let speakOn = true, toneOn = true, boxesOn = true;
 let fps = 0, frameNo = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
@@ -165,15 +168,31 @@ function tone(on, freq=620, pan=0, rate=3) {
 }
 
 // ===================== depth =====================
+// Tries each model in turn. q4f16 first (18 MB), fp32 as fallback (99 MB).
 async function loadDepth() {
   ort.env.wasm.numThreads = 1;
   ort.env.wasm.simd = true;
   const eps = ('gpu' in navigator) ? ['webgpu', 'wasm'] : ['wasm'];
-  depthSession = await ort.InferenceSession.create(DEPTH_URL, {
-    executionProviders: eps,
-    graphOptimizationLevel: 'all'
-  });
-  depthEP = eps[0];
+
+  let lastErr = null;
+  for (const url of DEPTH_URLS) {
+    const tag = url.split('/').pop();
+    try {
+      log(`Trying ${tag}...`);
+      depthSession = await ort.InferenceSession.create(url, {
+        executionProviders: eps,
+        graphOptimizationLevel: 'all'
+      });
+      depthTag = tag.replace('model_', '').replace('.onnx', '');
+      log(`Depth ready (${depthTag})`, 'ok');
+      return;
+    } catch (e) {
+      lastErr = e;
+      log(`${tag} failed: ${e.message}`, 'err');
+      depthSession = null;
+    }
+  }
+  throw lastErr || new Error('no depth model loaded');
 }
 
 function depthInput() {
@@ -277,7 +296,7 @@ async function loop() {
   if (depthOn && depthSession && frameNo % CFG.depthEveryN === 0) runDepth();
 
   const useDepth = depthOn && depthLanes;
-  const src   = useDepth ? depthLanes    : lanes;
+  const src   = useDepth ? depthLanes     : lanes;
   const enter = useDepth ? CFG.depthEnter : CFG.laneEnter;
   const exit  = useDepth ? CFG.depthExit  : CFG.laneExit;
 
@@ -353,7 +372,7 @@ async function loop() {
   fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
   hud.textContent =
     `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}` +
-      (useDepth ? `  depth ${depthMs.toFixed(0)}ms ${depthEP}` : '  depth off') + `\n` +
+      (useDepth ? `  depth ${depthMs.toFixed(0)}ms ${depthTag}` : '  depth off') + `\n` +
     `${preds.filter(p=>p.score>=CFG.minScore).length} obj  ${lastState}  ` +
     `L${laneAvg[0].toFixed(2)} C${laneAvg[1].toFixed(2)} R${laneAvg[2].toFixed(2)}` +
     (useDepth ? '  [depth]' : '  [boxes]');
@@ -419,7 +438,6 @@ bDepth.onclick = async () => {
     } catch (e) {
       bDepth.classList.remove('busy'); bDepth.textContent = 'Failed';
       alert('Depth load failed: ' + e.message);
-      console.warn(e);
       return;
     }
     bDepth.classList.remove('busy');
