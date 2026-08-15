@@ -17,6 +17,7 @@
   #say{position:absolute;left:0;right:0;bottom:88px;text-align:center;
     font-size:clamp(22px,6vw,40px);font-weight:800;letter-spacing:-.5px;
     text-shadow:0 2px 16px #000;pointer-events:none;padding:0 16px}
+  #say.wall{color:#ff5f56}
   #bar{position:absolute;left:0;right:0;bottom:74px;height:6px;display:flex;gap:3px;
     padding:0 14px;pointer-events:none}
   #bar div{flex:1;border-radius:3px;background:#333;transition:background .2s}
@@ -74,14 +75,14 @@ const CFG = {
   laneEnter:     0.07,    // box-area mode
   laneExit:      0.04,
 
-  depthEnter:    0.80,
+  depthEnter:    0.80,    // depth mode: lane blocked above this
   depthExit:     0.70,
-  depthEveryN:   4,       // raise to 6 to buy back frames
+  depthEveryN:   4,
   depthSize:     252,     // multiple of 14
   depthBandTop:  0.45,
 
   // flat-scene / wall detection
-  flatSpread:    0.28,
+  flatSpread:    0.28,    // depth spread below this = flat surface filling view
   flatFrames:    3,
 
   laneSmooth:    0.25,
@@ -285,7 +286,7 @@ function rawLanes(preds, W, H) {
 }
 
 function adviceFrom(blocked, avg) {
-  if (!blocked[1]) return null;                    // centre clear = no diversion
+  if (!blocked[1]) return null;                   // centre clear = no diversion
   if (!blocked[0] && !blocked[2]) return avg[0] <= avg[2] ? 'left' : 'right';
   if (!blocked[0]) return 'left';
   if (!blocked[2]) return 'right';
@@ -345,11 +346,11 @@ async function loop() {
     el.style.background = blocked[i] ? '#ff5f56' : '#30d158');
 
   // ---- candidate state ----
-  // Direction is only given when the CENTRE is blocked. A clear centre
-  // always means keep straight, whatever the sides are doing.
+  // Direction is only given when the CENTRE is blocked.
+  // A clear centre always means keep straight.
   let state, msg;
   if (wallNow) {
-    state = 'wall';    msg = 'Wall ahead';
+    state = 'wall';    msg = 'Stop. Wall ahead';
   } else if (blocked[1] && advice && advice !== 'none') {
     state = 'divert';  msg = `Go ${advice}`;
   } else if (blocked[1]) {
@@ -380,6 +381,7 @@ async function loop() {
     if (winner !== 'clear') say(msg);
   }
   sayEl.textContent = (lastState === 'clear') ? '' : msg;
+  sayEl.classList.toggle('wall', lastState === 'wall');
 
   // ---- tone ----
   if (wallNow) {
