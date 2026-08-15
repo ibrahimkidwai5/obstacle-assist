@@ -66,24 +66,29 @@
 <script>
 // ===================== tunables =====================
 const CFG = {
-  warnArea:      0.12,
   minScore:      0.45,
   voteWindow:    12,
   voteMajority:  0.60,
   speakEveryMs:  2000,
 
-  laneEnter:     0.07,    // box-area mode
+  laneEnter:     0.07,    // box-area mode (depth off)
   laneExit:      0.04,
+  warnArea:      0.12,    // box-area mode: object worth naming
 
-  depthEnter:    0.80,    // depth mode: lane blocked above this
+  depthEnter:    0.80,    // depth mode: lane blocked above this nearness
   depthExit:     0.70,
+  depthNear:     0.72,    // depth mode: object this near is worth naming
   depthEveryN:   4,
   depthSize:     252,     // multiple of 14
   depthBandTop:  0.45,
 
-  // flat-scene / wall detection
-  flatSpread:    0.28,    // depth spread below this = flat surface filling view
-  flatFrames:    3,
+  // ---- WALL DETECTION (planarity, not spread) ----
+  // A wall is a smooth surface: depth varies almost linearly across the view.
+  // An open room has structure - floor receding, objects at many depths.
+  // We fit z = ax + by + c and measure how much of the variance it explains.
+  planarR2:      0.86,    // fit this good = flat surface filling the view
+  planarNear:    0.55,    // ...and it must actually be close
+  flatFrames:    3,       // consecutive readings before committing
 
   laneSmooth:    0.25,
   commitMs:      2500
@@ -112,7 +117,8 @@ const dcx = dcv.getContext('2d', { willReadFrequently: true });
 let model = null, running = false;
 let depthSession = null, depthOn = false, depthBusy = false;
 let depthLanes = null, depthMs = 0, depthTag = '';
-let depthSpread = 1, flatCount = 0, isWall = false;
+let depthMap = null, depthW = 0, depthH = 0;      // normalised map, kept for lookups
+let planarFit = 0, planarLevel = 0, flatCount = 0, isWall = false;
 let speakOn = true, toneOn = true, boxesOn = true;
 let fps = 0, frameNo = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
@@ -208,7 +214,50 @@ function depthInput() {
   return new ort.Tensor('float32', out, [1, 3, S, S]);
 }
 
-// Per-lane nearness plus a flatness measure for the whole view.
+/* Least-squares plane fit over the whole view: z = a*x + b*y + c.
+   Returns R^2 - the fraction of depth variance the plane explains.
+   Wall filling the frame  -> near 1.0 (depth really is planar)
+   Room with floor+objects -> much lower (structure the plane can't capture) */
+function planarity(norm, w, h) {
+  let n=0, sx=0, sy=0, sz=0, sxx=0, sxy=0, syy=0, sxz=0, syz=0;
+  for (let y = 0; y < h; y += 3) {
+    for (let x = 0; x < w; x += 3) {
+      const X = x / w, Y = y / h, Z = norm[y * w + x];
+      n++; sx+=X; sy+=Y; sz+=Z;
+      sxx+=X*X; sxy+=X*Y; syy+=Y*Y; sxz+=X*Z; syz+=Y*Z;
+    }
+  }
+  if (n < 12) return 0;
+  // normal equations for [a,b,c]
+  const m = [[sxx,sxy,sx],[sxy,syy,sy],[sx,sy,n]];
+  const v = [sxz,syz,sz];
+  const det =
+    m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) -
+    m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) +
+    m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+  if (Math.abs(det) < 1e-12) return 0;
+  const inv = (r,c) => {
+    const i1=(r+1)%3, i2=(r+2)%3, j1=(c+1)%3, j2=(c+2)%3;
+    return (m[j1][i1]*m[j2][i2]-m[j1][i2]*m[j2][i1]) / det;
+  };
+  const a = inv(0,0)*v[0]+inv(0,1)*v[1]+inv(0,2)*v[2];
+  const b = inv(1,0)*v[0]+inv(1,1)*v[1]+inv(1,2)*v[2];
+  const c = inv(2,0)*v[0]+inv(2,1)*v[1]+inv(2,2)*v[2];
+
+  const mean = sz / n;
+  let ssRes = 0, ssTot = 0;
+  for (let y = 0; y < h; y += 3) {
+    for (let x = 0; x < w; x += 3) {
+      const X = x / w, Y = y / h, Z = norm[y * w + x];
+      const p = a*X + b*Y + c;
+      ssRes += (Z-p)*(Z-p);
+      ssTot += (Z-mean)*(Z-mean);
+    }
+  }
+  if (ssTot < 1e-9) return 1;                  // perfectly uniform = flat
+  return Math.max(0, 1 - ssRes/ssTot);
+}
+
 function analyseDepth(map, w, h) {
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < map.length; i++) {
@@ -216,29 +265,46 @@ function analyseDepth(map, w, h) {
     if (map[i] > hi) hi = map[i];
   }
   const rng = (hi - lo) || 1;
-  const y0 = Math.floor(h * CFG.depthBandTop);
 
-  const all = [];
+  // normalised copy, kept so box lookups can read depth
+  const norm = new Float32Array(map.length);
+  for (let i = 0; i < map.length; i++) norm[i] = (map[i] - lo) / rng;
+
+  const y0 = Math.floor(h * CFG.depthBandTop);
   const lanes = [[], [], []];
+  let sum = 0, cnt = 0;
   for (let y = y0; y < h; y += 2) {
     for (let x = 0; x < w; x += 2) {
-      const v = (map[y * w + x] - lo) / rng;
-      all.push(v);
+      const v = norm[y * w + x];
       lanes[Math.min(2, Math.floor((x / w) * 3))].push(v);
+      sum += v; cnt++;
     }
   }
-
-  all.sort();
-  const q = f => all[Math.floor(all.length * f)];
-  const spread = all.length ? (q(0.90) - q(0.10)) : 1;
-
   const out = lanes.map(v => {
     if (!v.length) return 0;
     v.sort();
     return v[Math.floor(v.length * 0.8)];
   });
 
-  return { lanes: out, spread };
+  return { lanes: out, norm, fit: planarity(norm, w, h), level: cnt ? sum/cnt : 0 };
+}
+
+// median normalised depth inside a detection box -> nearness 0..1
+function depthOfBox(box, W, H) {
+  if (!depthMap) return null;
+  const [x, y, w, h] = box;
+  const sx = depthW / W, sy = depthH / H;
+  let x1 = Math.round((x + w*0.2) * sx), x2 = Math.round((x + w*0.8) * sx);
+  let y1 = Math.round((y + h*0.2) * sy), y2 = Math.round((y + h*0.8) * sy);
+  x1 = Math.max(0, x1); x2 = Math.min(depthW, x2);
+  y1 = Math.max(0, y1); y2 = Math.min(depthH, y2);
+  if (x2 <= x1 || y2 <= y1) return null;
+  const vals = [];
+  for (let yy = y1; yy < y2; yy += 2)
+    for (let xx = x1; xx < x2; xx += 2) vals.push(depthMap[yy * depthW + xx]);
+  if (!vals.length) return null;
+  vals.sort();
+  return vals[Math.floor(vals.length * 0.8)];     // nearest part of the object
 }
 
 async function runDepth() {
@@ -253,40 +319,57 @@ async function runDepth() {
     const d = out.dims;
     const h = d[d.length-2], w = d[d.length-1];
     const a = analyseDepth(out.data, w, h);
+
     depthLanes = a.lanes;
-    depthSpread = a.spread;
-    if (depthSpread < CFG.flatSpread) flatCount++; else flatCount = 0;
+    depthMap = a.norm; depthW = w; depthH = h;
+    planarFit = a.fit; planarLevel = a.level;
+
+    // wall = the view is planar AND that plane is close to us
+    if (planarFit >= CFG.planarR2 && planarLevel >= CFG.planarNear) flatCount++;
+    else flatCount = 0;
     isWall = flatCount >= CFG.flatFrames;
+
     depthMs = performance.now() - t;
   } catch (e) {
     console.warn('depth', e);
     log('Depth run failed: ' + e.message, 'err');
-    depthOn = false; depthLanes = null; isWall = false;
+    depthOn = false; depthLanes = null; depthMap = null; isWall = false;
     bDepth.classList.remove('on');
   }
   depthBusy = false;
 }
 
 // ============ scene logic (pure - portable to Python) ============
-function rawLanes(preds, W, H) {
+// Detections are scored by DEPTH when available, box area otherwise.
+function analyseObjects(preds, W, H, useDepth) {
   const frameArea = W * H;
   const lanes = [0, 0, 0];
+  const items = [];
   let worst = null;
+
   for (const p of preds) {
     if (p.score < CFG.minScore) continue;
     const [x, y, w, h] = p.bbox;
     const area = (w * h) / frameArea;
     const cxn = (x + w / 2) / W;
+    const near = useDepth ? depthOfBox(p.bbox, W, H) : null;
+
     const l0 = Math.max(0, Math.floor((x / W) * 3));
     const l1 = Math.min(2, Math.floor(((x + w) / W) * 3));
     for (let i = l0; i <= l1; i++) lanes[i] += area;
-    if (!worst || area > worst.area) worst = { label: p.class, area, cxn };
+
+    const item = { label: p.class, area, cxn, near, box: p.bbox };
+    items.push(item);
+
+    // rank by real nearness when we have it, by apparent size otherwise
+    const score = (near != null) ? near : area;
+    if (!worst || score > worst.score) worst = { ...item, score };
   }
-  return { lanes, worst };
+  return { lanes, items, worst };
 }
 
 function adviceFrom(blocked, avg) {
-  if (!blocked[1]) return null;                   // centre clear = no diversion
+  if (!blocked[1]) return null;                   // centre clear = keep straight
   if (!blocked[0] && !blocked[2]) return avg[0] <= avg[2] ? 'left' : 'right';
   if (!blocked[0]) return 'left';
   if (!blocked[2]) return 'right';
@@ -305,17 +388,17 @@ async function loop() {
   try { preds = await model.detect(vid, 8); } catch(e) { console.warn(e); }
 
   const W = cvs.width, H = cvs.height;
-  const { lanes, worst } = rawLanes(preds, W, H);
 
   if (depthOn && depthSession && frameNo % CFG.depthEveryN === 0) runDepth();
 
-  const useDepth = depthOn && depthLanes;
+  const useDepth = depthOn && depthLanes && depthMap;
+  const { lanes, items, worst } = analyseObjects(preds, W, H, useDepth);
+
   const src   = useDepth ? depthLanes     : lanes;
   const enter = useDepth ? CFG.depthEnter : CFG.laneEnter;
   const exit  = useDepth ? CFG.depthExit  : CFG.laneExit;
 
   laneAvg = laneAvg.map((v,i) => v * (1 - CFG.laneSmooth) + src[i] * CFG.laneSmooth);
-
   let blocked = laneAvg.map((a,i) => blockedState[i] ? a >= exit : a >= enter);
 
   const wallNow = useDepth && isWall;
@@ -329,25 +412,34 @@ async function loop() {
     else { committedSide = advice; committedAt = now; }
   } else committedSide = null;
 
-  // ---- draw ----
+  // is the leading object actually close?
+  const worstNear = worst
+    ? (worst.near != null ? worst.near >= CFG.depthNear
+                          : worst.area >= CFG.warnArea)
+    : false;
+
+  // ---- draw: colour boxes by DEPTH when we have it ----
   ctx.clearRect(0,0,W,H);
   if (boxesOn) {
-    for (const p of preds) {
-      if (p.score < CFG.minScore) continue;
-      const [x,y,w,h] = p.bbox;
-      const a = (w*h)/(W*H);
-      ctx.strokeStyle = a >= CFG.warnArea ? '#ffbd2e' : '#30d158';
-      ctx.lineWidth = 3; ctx.strokeRect(x,y,w,h);
-      ctx.fillStyle = ctx.strokeStyle; ctx.font = '600 15px system-ui';
-      ctx.fillText(p.class, x+4, Math.max(15, y-5));
+    for (const it of items) {
+      const [x,y,w,h] = it.box;
+      let colour;
+      if (it.near != null)
+        colour = it.near >= CFG.depthNear ? '#ff5f56'
+               : it.near >= CFG.depthNear - 0.15 ? '#ffbd2e' : '#30d158';
+      else
+        colour = it.area >= CFG.warnArea ? '#ffbd2e' : '#30d158';
+      ctx.strokeStyle = colour; ctx.lineWidth = 3;
+      ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle = colour; ctx.font = '600 15px system-ui';
+      const tag = it.near != null ? `${it.label} ${it.near.toFixed(2)}` : it.label;
+      ctx.fillText(tag, x+4, Math.max(15, y-5));
     }
   }
   lanesEl.forEach((el,i) =>
     el.style.background = blocked[i] ? '#ff5f56' : '#30d158');
 
   // ---- candidate state ----
-  // Direction is only given when the CENTRE is blocked.
-  // A clear centre always means keep straight.
   let state, msg;
   if (wallNow) {
     state = 'wall';    msg = 'Stop. Wall ahead';
@@ -361,7 +453,7 @@ async function loop() {
     state = 'sideL';   msg = 'Obstacle left, keep straight';
   } else if (blocked[2]) {
     state = 'sideR';   msg = 'Obstacle right, keep straight';
-  } else if (worst && worst.area >= CFG.warnArea) {
+  } else if (worst && worstNear) {
     state = 'note';    msg = `${worst.label} ${sideWord(worst.cxn)}`;
   } else {
     state = 'clear';   msg = 'Clear';
@@ -383,11 +475,13 @@ async function loop() {
   sayEl.textContent = (lastState === 'clear') ? '' : msg;
   sayEl.classList.toggle('wall', lastState === 'wall');
 
-  // ---- tone ----
+  // ---- tone: driven by depth when available ----
   if (wallNow) {
     tone(true, 1150, 0, 11);
-  } else if (worst && worst.area >= CFG.warnArea) {
-    const t = Math.min(1, worst.area / 0.30);
+  } else if (worst && worstNear) {
+    const t = worst.near != null
+      ? Math.min(1, Math.max(0, (worst.near - 0.4) / 0.6))
+      : Math.min(1, worst.area / 0.30);
     tone(true, 420 + t*820, (worst.cxn*2-1), 2 + t*10);
   } else tone(false);
 
@@ -397,9 +491,10 @@ async function loop() {
   hud.textContent =
     `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}` +
       (useDepth ? `  depth ${depthMs.toFixed(0)}ms ${depthTag}` : '  depth off') + `\n` +
-    `${preds.filter(p=>p.score>=CFG.minScore).length} obj  ${lastState}  ` +
+    `${items.length} obj  ${lastState}  ` +
     `L${laneAvg[0].toFixed(2)} C${laneAvg[1].toFixed(2)} R${laneAvg[2].toFixed(2)}` +
-    (useDepth ? `  spread ${depthSpread.toFixed(2)}${isWall ? ' WALL' : ''}` : '  [boxes]');
+    (useDepth ? `  fit ${planarFit.toFixed(2)} lvl ${planarLevel.toFixed(2)}` +
+                `${isWall ? ' WALL' : ''}` : '  [boxes]');
 
   requestAnimationFrame(loop);
 }
@@ -425,7 +520,7 @@ document.getElementById('go').onclick = async () => {
 
     log('Loading detector...');
     model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-    log('Ready. Tap Depth for walls.', 'ok');
+    log('Ready. Tap Depth for walls + distances.', 'ok');
 
     splash.style.display = 'none';
     running = true;
@@ -448,7 +543,8 @@ document.getElementById('bBoxes').onclick = e => {
 };
 bDepth.onclick = async () => {
   if (depthOn) {
-    depthOn = false; depthLanes = null; isWall = false; flatCount = 0;
+    depthOn = false; depthLanes = null; depthMap = null;
+    isWall = false; flatCount = 0;
     bDepth.classList.remove('on');
     laneAvg = [0,0,0]; blockedState = [false,false,false];
     return;
@@ -462,7 +558,8 @@ bDepth.onclick = async () => {
     }
     bDepth.classList.remove('busy');
   }
-  depthOn = true; depthLanes = null; flatCount = 0; isWall = false;
+  depthOn = true; depthLanes = null; depthMap = null;
+  flatCount = 0; isWall = false;
   laneAvg = [0,0,0]; blockedState = [false,false,false];
   bDepth.classList.add('on');
 };
