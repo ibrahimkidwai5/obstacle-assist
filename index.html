@@ -15,7 +15,7 @@
     font-family:ui-monospace,monospace;line-height:1.5;white-space:pre;
     text-shadow:0 1px 3px #000;pointer-events:none;opacity:.85}
   #say{position:absolute;left:0;right:0;bottom:88px;text-align:center;
-    font-size:clamp(22px,6vw,40px);font-weight:800;letter-spacing:-.5px;
+    font-size:clamp(20px,5.5vw,38px);font-weight:800;letter-spacing:-.5px;
     text-shadow:0 2px 16px #000;pointer-events:none;padding:0 16px}
   #say.wall{color:#ff5f56}
   #bar{position:absolute;left:0;right:0;bottom:74px;height:6px;display:flex;gap:3px;
@@ -66,29 +66,33 @@
 <script>
 // ===================== tunables =====================
 const CFG = {
-  minScore:      0.45,
+  minScore:      0.40,
   voteWindow:    12,
   voteMajority:  0.60,
   speakEveryMs:  2000,
 
   laneEnter:     0.07,    // box-area mode (depth off)
   laneExit:      0.04,
-  warnArea:      0.12,    // box-area mode: object worth naming
+  warnArea:      0.10,
 
   depthEnter:    0.80,    // depth mode: lane blocked above this nearness
   depthExit:     0.70,
-  depthNear:     0.72,    // depth mode: object this near is worth naming
+  depthNear:     0.68,
   depthEveryN:   4,
   depthSize:     252,     // multiple of 14
   depthBandTop:  0.45,
 
-  // ---- WALL DETECTION (planarity, not spread) ----
-  // A wall is a smooth surface: depth varies almost linearly across the view.
-  // An open room has structure - floor receding, objects at many depths.
-  // We fit z = ax + by + c and measure how much of the variance it explains.
-  planarR2:      0.86,    // fit this good = flat surface filling the view
-  planarNear:    0.55,    // ...and it must actually be close
-  flatFrames:    3,       // consecutive readings before committing
+  // ---- WALL DETECTION ----
+  // A wall is a plane that FACES you: flat fit AND little depth gradient.
+  // A floor is also a plane, but steeply tilted (near at the bottom of frame),
+  // so the gradient check is what separates the two.
+  planarR2:      0.72,    // how well a plane explains the depth
+  gradMaxY:      0.32,    // |dz/dy| above this = floor or ceiling, not a wall
+  gradMaxX:      0.32,    // |dz/dx| above this = wall seen at an angle
+  planarNear:    0.42,    // the plane must be reasonably close
+  flatFrames:    2,
+
+  nameStickyMs:  2500,    // remember a lane's object name this long
 
   laneSmooth:    0.25,
   commitMs:      2500
@@ -117,8 +121,9 @@ const dcx = dcv.getContext('2d', { willReadFrequently: true });
 let model = null, running = false;
 let depthSession = null, depthOn = false, depthBusy = false;
 let depthLanes = null, depthMs = 0, depthTag = '';
-let depthMap = null, depthW = 0, depthH = 0;      // normalised map, kept for lookups
-let planarFit = 0, planarLevel = 0, flatCount = 0, isWall = false;
+let depthMap = null, depthW = 0, depthH = 0;
+let planarFit = 0, planarLevel = 0, gradX = 0, gradY = 0;
+let flatCount = 0, isWall = false;
 let speakOn = true, toneOn = true, boxesOn = true;
 let fps = 0, frameNo = 0;
 let lastMsg = '', lastMsgAt = 0, lastState = '';
@@ -126,6 +131,12 @@ let blockedState = [false, false, false];
 let laneAvg = [0, 0, 0];
 let voteBuf = [];
 let committedSide = null, committedAt = 0;
+let objCount = 0;
+
+// sticky per-lane object names, so a one-frame detection dropout
+// doesn't turn "Chair left" back into "Obstacle left"
+let laneName = [null, null, null];
+let laneNameAt = [0, 0, 0];
 
 const log = (m, c='') => { logEl.innerHTML += `\n<span class="${c}">${m}</span>`;
                            logEl.scrollTop = 1e6; };
@@ -214,11 +225,12 @@ function depthInput() {
   return new ort.Tensor('float32', out, [1, 3, S, S]);
 }
 
-/* Least-squares plane fit over the whole view: z = a*x + b*y + c.
-   Returns R^2 - the fraction of depth variance the plane explains.
-   Wall filling the frame  -> near 1.0 (depth really is planar)
-   Room with floor+objects -> much lower (structure the plane can't capture) */
-function planarity(norm, w, h) {
+/* Fit z = a*x + b*y + c over the view.
+   Returns R^2 plus the gradients a (horizontal) and b (vertical).
+   Wall facing you : R2 high, a and b both near 0
+   Floor           : R2 high, b large  <- this is what we must reject
+   Room with stuff : R2 low                                            */
+function planeFit(norm, w, h) {
   let n=0, sx=0, sy=0, sz=0, sxx=0, sxy=0, syy=0, sxz=0, syz=0;
   for (let y = 0; y < h; y += 3) {
     for (let x = 0; x < w; x += 3) {
@@ -227,15 +239,14 @@ function planarity(norm, w, h) {
       sxx+=X*X; sxy+=X*Y; syy+=Y*Y; sxz+=X*Z; syz+=Y*Z;
     }
   }
-  if (n < 12) return 0;
-  // normal equations for [a,b,c]
+  if (n < 12) return { r2: 0, a: 0, b: 0 };
   const m = [[sxx,sxy,sx],[sxy,syy,sy],[sx,sy,n]];
   const v = [sxz,syz,sz];
   const det =
     m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) -
     m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) +
     m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
-  if (Math.abs(det) < 1e-12) return 0;
+  if (Math.abs(det) < 1e-12) return { r2: 0, a: 0, b: 0 };
   const inv = (r,c) => {
     const i1=(r+1)%3, i2=(r+2)%3, j1=(c+1)%3, j2=(c+2)%3;
     return (m[j1][i1]*m[j2][i2]-m[j1][i2]*m[j2][i1]) / det;
@@ -254,8 +265,8 @@ function planarity(norm, w, h) {
       ssTot += (Z-mean)*(Z-mean);
     }
   }
-  if (ssTot < 1e-9) return 1;                  // perfectly uniform = flat
-  return Math.max(0, 1 - ssRes/ssTot);
+  const r2 = ssTot < 1e-9 ? 1 : Math.max(0, 1 - ssRes/ssTot);
+  return { r2, a, b };
 }
 
 function analyseDepth(map, w, h) {
@@ -265,8 +276,6 @@ function analyseDepth(map, w, h) {
     if (map[i] > hi) hi = map[i];
   }
   const rng = (hi - lo) || 1;
-
-  // normalised copy, kept so box lookups can read depth
   const norm = new Float32Array(map.length);
   for (let i = 0; i < map.length; i++) norm[i] = (map[i] - lo) / rng;
 
@@ -286,10 +295,11 @@ function analyseDepth(map, w, h) {
     return v[Math.floor(v.length * 0.8)];
   });
 
-  return { lanes: out, norm, fit: planarity(norm, w, h), level: cnt ? sum/cnt : 0 };
+  const pf = planeFit(norm, w, h);
+  return { lanes: out, norm, fit: pf.r2, gx: pf.a, gy: pf.b,
+           level: cnt ? sum/cnt : 0 };
 }
 
-// median normalised depth inside a detection box -> nearness 0..1
 function depthOfBox(box, W, H) {
   if (!depthMap) return null;
   const [x, y, w, h] = box;
@@ -304,7 +314,7 @@ function depthOfBox(box, W, H) {
     for (let xx = x1; xx < x2; xx += 2) vals.push(depthMap[yy * depthW + xx]);
   if (!vals.length) return null;
   vals.sort();
-  return vals[Math.floor(vals.length * 0.8)];     // nearest part of the object
+  return vals[Math.floor(vals.length * 0.8)];
 }
 
 async function runDepth() {
@@ -323,10 +333,15 @@ async function runDepth() {
     depthLanes = a.lanes;
     depthMap = a.norm; depthW = w; depthH = h;
     planarFit = a.fit; planarLevel = a.level;
+    gradX = a.gx; gradY = a.gy;
 
-    // wall = the view is planar AND that plane is close to us
-    if (planarFit >= CFG.planarR2 && planarLevel >= CFG.planarNear) flatCount++;
-    else flatCount = 0;
+    // wall = planar AND fronto-parallel AND close.
+    // The gradient test is what rejects floors and ceilings.
+    const wallish = planarFit >= CFG.planarR2 &&
+                    Math.abs(gradY) <= CFG.gradMaxY &&
+                    Math.abs(gradX) <= CFG.gradMaxX &&
+                    planarLevel >= CFG.planarNear;
+    if (wallish) flatCount++; else flatCount = 0;
     isWall = flatCount >= CFG.flatFrames;
 
     depthMs = performance.now() - t;
@@ -340,7 +355,6 @@ async function runDepth() {
 }
 
 // ============ scene logic (pure - portable to Python) ============
-// Detections are scored by DEPTH when available, box area otherwise.
 function analyseObjects(preds, W, H, useDepth) {
   const frameArea = W * H;
   const lanes = [0, 0, 0];
@@ -358,25 +372,40 @@ function analyseObjects(preds, W, H, useDepth) {
     const l1 = Math.min(2, Math.floor(((x + w) / W) * 3));
     for (let i = l0; i <= l1; i++) lanes[i] += area;
 
-    const item = { label: p.class, area, cxn, near, box: p.bbox };
+    const item = { label: p.class, area, cxn, near, l0, l1, box: p.bbox };
     items.push(item);
 
-    // rank by real nearness when we have it, by apparent size otherwise
     const score = (near != null) ? near : area;
     if (!worst || score > worst.score) worst = { ...item, score };
   }
   return { lanes, items, worst };
 }
 
-function adviceFrom(blocked, avg) {
-  if (!blocked[1]) return null;                   // centre clear = keep straight
-  if (!blocked[0] && !blocked[2]) return avg[0] <= avg[2] ? 'left' : 'right';
+// refresh sticky names, then read them back
+function updateLaneNames(items) {
+  const now = performance.now();
+  for (let L = 0; L < 3; L++) {
+    let best = null;
+    for (const it of items) {
+      if (L < it.l0 || L > it.l1) continue;
+      const s = (it.near != null) ? it.near : it.area;
+      if (!best || s > best.s) best = { s, label: it.label };
+    }
+    if (best) { laneName[L] = best.label; laneNameAt[L] = now; }
+    else if (now - laneNameAt[L] > CFG.nameStickyMs) laneName[L] = null;
+  }
+}
+
+function adviceFrom(blocked) {
+  if (!blocked[1]) return null;
+  if (!blocked[0] && !blocked[2]) return 'both';
   if (!blocked[0]) return 'left';
   if (!blocked[2]) return 'right';
   return 'none';
 }
 
 function sideWord(cxn) { return cxn < 0.38 ? 'left' : cxn > 0.62 ? 'right' : 'ahead'; }
+const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 
 // ===================== main loop =====================
 async function loop() {
@@ -393,6 +422,8 @@ async function loop() {
 
   const useDepth = depthOn && depthLanes && depthMap;
   const { lanes, items, worst } = analyseObjects(preds, W, H, useDepth);
+  objCount = items.length;
+  updateLaneNames(items);
 
   const src   = useDepth ? depthLanes     : lanes;
   const enter = useDepth ? CFG.depthEnter : CFG.laneEnter;
@@ -405,20 +436,18 @@ async function loop() {
   if (wallNow) blocked = [true, true, true];
   blockedState = blocked;
 
-  let advice = wallNow ? 'none' : adviceFrom(blocked, laneAvg);
+  let advice = wallNow ? 'none' : adviceFrom(blocked);
   if (advice === 'left' || advice === 'right') {
     const now = performance.now();
     if (committedSide && now - committedAt < CFG.commitMs) advice = committedSide;
     else { committedSide = advice; committedAt = now; }
   } else committedSide = null;
 
-  // is the leading object actually close?
   const worstNear = worst
-    ? (worst.near != null ? worst.near >= CFG.depthNear
-                          : worst.area >= CFG.warnArea)
+    ? (worst.near != null ? worst.near >= CFG.depthNear : worst.area >= CFG.warnArea)
     : false;
 
-  // ---- draw: colour boxes by DEPTH when we have it ----
+  // ---- draw ----
   ctx.clearRect(0,0,W,H);
   if (boxesOn) {
     for (const it of items) {
@@ -439,22 +468,33 @@ async function loop() {
   lanesEl.forEach((el,i) =>
     el.style.background = blocked[i] ? '#ff5f56' : '#30d158');
 
-  // ---- candidate state ----
+  // ---- state; the obstacle is named from the sticky lane names ----
+  const nL = laneName[0], nMid = laneName[1], nR = laneName[2];
+
   let state, msg;
   if (wallNow) {
     state = 'wall';    msg = 'Stop. Wall ahead';
-  } else if (blocked[1] && advice && advice !== 'none') {
-    state = 'divert';  msg = `Go ${advice}`;
+  } else if (blocked[1] && advice === 'both') {
+    state = 'midblock';
+    msg = nMid ? `Middle path blocked, ${nMid}` : 'Middle path blocked';
+  } else if (blocked[1] && (advice === 'left' || advice === 'right')) {
+    state = 'divert';
+    msg = nMid ? `${cap(nMid)} ahead, go ${advice}` : `Go ${advice}`;
   } else if (blocked[1]) {
-    state = 'blocked'; msg = 'Blocked ahead';
+    state = 'blocked';
+    msg = nMid ? `Blocked ahead, ${nMid}` : 'Blocked ahead';
   } else if (blocked[0] && blocked[2]) {
-    state = 'sides';   msg = 'Obstacles both sides, keep straight';
+    state = 'sides';
+    msg = 'Obstacles both sides, keep straight';
   } else if (blocked[0]) {
-    state = 'sideL';   msg = 'Obstacle left, keep straight';
+    state = 'sideL';
+    msg = `${cap(nL) || 'Obstacle'} left, keep straight`;
   } else if (blocked[2]) {
-    state = 'sideR';   msg = 'Obstacle right, keep straight';
+    state = 'sideR';
+    msg = `${cap(nR) || 'Obstacle'} right, keep straight`;
   } else if (worst && worstNear) {
-    state = 'note';    msg = `${worst.label} ${sideWord(worst.cxn)}`;
+    state = 'note';
+    msg = `${cap(worst.label)} ${sideWord(worst.cxn)}`;
   } else {
     state = 'clear';   msg = 'Clear';
   }
@@ -469,13 +509,15 @@ async function loop() {
 
   if (voteBuf.length >= CFG.voteWindow && best / voteBuf.length >= CFG.voteMajority) {
     lastState = winner;
+    // prefer the newest message for the winning state, which now carries
+    // a sticky name even if detection blinked
     msg = [...voteBuf].reverse().find(v => v.state === winner).msg;
     if (winner !== 'clear') say(msg);
   }
   sayEl.textContent = (lastState === 'clear') ? '' : msg;
   sayEl.classList.toggle('wall', lastState === 'wall');
 
-  // ---- tone: driven by depth when available ----
+  // ---- tone ----
   if (wallNow) {
     tone(true, 1150, 0, 11);
   } else if (worst && worstNear) {
@@ -490,10 +532,11 @@ async function loop() {
   fps = fps ? fps*.85 + (1000/ms)*.15 : 1000/ms;
   hud.textContent =
     `${fps.toFixed(1)} fps  ${ms.toFixed(0)} ms  ${tf.getBackend()}` +
-      (useDepth ? `  depth ${depthMs.toFixed(0)}ms ${depthTag}` : '  depth off') + `\n` +
+      (useDepth ? `  depth ${depthMs.toFixed(0)}ms` : '  depth off') + `\n` +
     `${items.length} obj  ${lastState}  ` +
     `L${laneAvg[0].toFixed(2)} C${laneAvg[1].toFixed(2)} R${laneAvg[2].toFixed(2)}` +
-    (useDepth ? `  fit ${planarFit.toFixed(2)} lvl ${planarLevel.toFixed(2)}` +
+    (useDepth ? `  fit ${planarFit.toFixed(2)} gy ${gradY.toFixed(2)} ` +
+                `gx ${gradX.toFixed(2)} lvl ${planarLevel.toFixed(2)}` +
                 `${isWall ? ' WALL' : ''}` : '  [boxes]');
 
   requestAnimationFrame(loop);
